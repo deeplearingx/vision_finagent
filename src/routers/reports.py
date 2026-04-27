@@ -1,0 +1,492 @@
+import asyncio
+import json
+import os
+import structlog
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, List
+
+from ..config import settings
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from pydantic import BaseModel
+
+log = structlog.get_logger()
+from ..models.schema import PageResult, EvidenceSummary
+from ..models.enums import ReportStatus, DegradeReason
+from ..utils.idempotency import check_and_set
+from ..services.retrieval_service import retrieve
+from ..services.vlm_service import generate_answer
+from ..services.task_service import submit_ingest_task, get_task
+from ..core.redis_client import get_redis
+from ..core.milvus_client import clear_report_collections
+
+# Redis key: session:{session_id}  TTL: 2 days
+_SESSION_TTL = 2 * 86400
+_SESSION_MAX_HISTORY = 40
+_SESSION_INDEX_KEY = "session_index"
+_SESSION_LIST_LIMIT = 50
+
+router = APIRouter(prefix="/reports")
+
+# ---------------------------------------------------------------------------
+# Maintenance lock: prevents concurrent upload/query during clear-collections.
+# ---------------------------------------------------------------------------
+_maintenance_lock = asyncio.Lock()
+_maintenance_active = False
+
+
+_ALLOWED_EXTS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _is_valid_pdf(data: bytes) -> bool:
+    tail = data[-1024:]
+    return data[:4] == b"%PDF" and (b"%%EOF" in tail or b"%EOF" in tail)
+
+
+def _is_valid_image(data: bytes, ext: str) -> bool:
+    if ext in (".jpg", ".jpeg"):
+        return data[:3] == b"\xff\xd8\xff"
+    if ext == ".png":
+        return data[:4] == b"\x89PNG"
+    if ext == ".webp":
+        return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+    return False
+
+
+class QueryRequest(BaseModel):
+    question: str
+    target_companies: list[str] = []
+    top_k: int = 5
+    candidate_k: int = 50
+    session_id: str | None = None
+    use_retrieval: bool = True
+    refresh_retrieval: bool = False
+
+
+@router.post("/upload", status_code=202)
+async def upload_report(
+    file: UploadFile = File(...),
+    report_id: str = Form(default=""),
+):
+    if _maintenance_active:
+        raise HTTPException(503, "系统维护中，暂停上传，请稍后重试")
+    if not report_id:
+        report_id = f"report_{uuid.uuid4().hex[:8]}"
+    token = f"upload:{report_id}"
+    if not await check_and_set(token):
+        raise HTTPException(409, "Duplicate upload")
+
+    data = await file.read()
+
+    suffix = os.path.splitext(file.filename or "")[1].lower() or ".pdf"
+    if suffix not in _ALLOWED_EXTS:
+        raise HTTPException(400, f"Unsupported file type: {suffix}. Allowed: {', '.join(_ALLOWED_EXTS)}")
+
+    if suffix == ".pdf":
+        if not _is_valid_pdf(data):
+            raise HTTPException(400, "Invalid PDF: missing %PDF header or %%EOF marker")
+    else:
+        if not _is_valid_image(data, suffix):
+            raise HTTPException(400, f"Invalid image: magic bytes do not match {suffix}")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    task_id = await submit_ingest_task(report_id, tmp_path)
+    return {
+        "report_id": report_id,
+        "task_id": task_id,
+        "status": ReportStatus.PENDING,
+    }
+
+
+@router.get("/tasks/{task_id}")
+async def get_task_status(task_id: str):
+    info = await get_task(task_id)
+    if info is None:
+        raise HTTPException(404, "Task not found")
+    return {
+        "task_id": info.task_id,
+        "report_id": info.report_id,
+        "status": info.status,
+        "detail": info.detail,
+        "created_at": info.created_at,
+        "updated_at": info.updated_at,
+    }
+
+
+async def _load_history(session_id: str) -> list[dict]:
+    r = await get_redis()
+    raw = await r.get(f"session:{session_id}")
+    if raw is None:
+        return []
+    return json.loads(raw)
+
+
+async def _save_history(session_id: str, hist: list[dict]) -> None:
+    r = await get_redis()
+    await r.set(f"session:{session_id}", json.dumps(hist), ex=_SESSION_TTL)
+
+
+async def _load_session_meta(session_id: str) -> dict[str, Any]:
+    r = await get_redis()
+    raw = await r.get(f"session:{session_id}:meta")
+    if raw is None:
+        return {}
+    return json.loads(raw)
+
+
+async def _save_session_meta(session_id: str, meta: dict[str, Any]) -> None:
+    r = await get_redis()
+    await r.set(f"session:{session_id}:meta", json.dumps(meta), ex=_SESSION_TTL)
+
+
+async def _touch_session_index(session_id: str, updated_ts: float) -> None:
+    r = await get_redis()
+    await r.zadd(_SESSION_INDEX_KEY, {session_id: updated_ts})
+    await r.expire(_SESSION_INDEX_KEY, _SESSION_TTL)
+
+
+def _iso_from_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+async def _persist_session_state(
+    session_id: str,
+    hist: list[dict],
+    *,
+    last_question: str,
+    has_evidence: bool,
+) -> None:
+    updated_ts = time.time()
+    await _save_history(session_id, hist)
+    await _save_session_meta(
+        session_id,
+        {
+            "session_id": session_id,
+            "updated_at": _iso_from_ts(updated_ts),
+            "updated_ts": updated_ts,
+            "last_question": last_question[:120],
+            "turn_count": sum(1 for item in hist if item.get("role") == "user"),
+            "has_evidence": has_evidence,
+        },
+    )
+    await _touch_session_index(session_id, updated_ts)
+
+
+async def _load_evidence_cache(session_id: str) -> dict[str, Any] | None:
+    r = await get_redis()
+    raw = await r.get(f"session:{session_id}:evidence")
+    if raw is None:
+        return None
+    return json.loads(raw)
+
+
+async def _save_evidence_cache(session_id: str, pages: list[PageResult]) -> None:
+    """Store only lightweight meta (no image_base64) to keep Redis payload small."""
+    r = await get_redis()
+    payload = {
+        "cached_at": _iso_from_ts(time.time()),
+        "evidence": [
+            {
+                "report_id": page.report_id,
+                "page_num": page.page_num,
+                "maxsim_score": page.maxsim_score,
+            }
+            for page in pages
+        ],
+    }
+    await r.set(f"session:{session_id}:evidence", json.dumps(payload), ex=_SESSION_TTL)
+
+
+async def _clear_evidence_cache(session_id: str) -> None:
+    r = await get_redis()
+    await r.delete(f"session:{session_id}:evidence")
+
+
+async def _backfill_meta(session_id: str, score: float) -> dict:
+    """Minimal meta backfill for legacy sessions that have history but no meta key."""
+    hist = await _load_history(session_id)
+    if not hist:
+        return {}
+    user_turns = [m for m in hist if m.get("role") == "user"]
+    last_q = user_turns[-1]["content"] if user_turns else ""
+    meta = {
+        "session_id": session_id,
+        "updated_at": _iso_from_ts(score),
+        "updated_ts": score,
+        "last_question": last_q[:120],
+        "turn_count": len(user_turns),
+        "has_evidence": False,
+        "_backfilled": True,
+    }
+    await _save_session_meta(session_id, meta)
+    log.info("session_meta_backfilled", session_id=session_id)
+    return meta
+
+
+@router.get("/sessions")
+async def list_sessions():
+    r = await get_redis()
+    entries = await r.zrevrange(_SESSION_INDEX_KEY, 0, _SESSION_LIST_LIMIT - 1, withscores=True)
+    result = []
+    for sid, score in entries:
+        meta = await _load_session_meta(sid)
+        if not meta:
+            # Issue 4: legacy session has no meta — attempt minimal backfill
+            meta = await _backfill_meta(sid, score)
+        if not meta:
+            continue
+        has_evidence = bool(meta.get("has_evidence"))
+        result.append({
+            "session_id": sid,
+            "updated_at": meta.get("updated_at") or _iso_from_ts(score),
+            "last_question": meta.get("last_question", "")[:80],
+            "turn_count": meta.get("turn_count", 0),
+            "has_evidence": has_evidence,
+        })
+    return {"sessions": result}
+
+
+@router.get("/sessions/{session_id}/history")
+async def get_session_history(session_id: str):
+    hist = await _load_history(session_id)
+    if not hist:
+        raise HTTPException(404, "Session not found")
+    return {"session_id": session_id, "history": hist}
+
+
+@router.get("/sessions/{session_id}/evidence-status")
+async def get_session_evidence_status(session_id: str):
+    """Return real-time evidence cache status for a session."""
+    evidence_cache = await _load_evidence_cache(session_id)
+    has_evidence = bool(evidence_cache and evidence_cache.get("evidence"))
+    return {"session_id": session_id, "has_evidence": has_evidence}
+
+
+_MAINTENANCE_REDIS_KEY = "maintenance:clear_collections"
+_MAINTENANCE_REDIS_TTL = 300  # 5 min safety expiry
+
+
+async def _acquire_redis_maintenance(r) -> bool:
+    """SET NX EX — returns True if this caller acquired the lock."""
+    return bool(await r.set(_MAINTENANCE_REDIS_KEY, "1", nx=True, ex=_MAINTENANCE_REDIS_TTL))
+
+
+async def _release_redis_maintenance(r) -> None:
+    await r.delete(_MAINTENANCE_REDIS_KEY)
+
+
+@router.post("/admin/clear-collections", status_code=200)
+async def clear_collections():
+    global _maintenance_active
+    r = await get_redis()
+
+    # Fast-path: in-process flag (single-process guard, zero-latency)
+    if _maintenance_active:
+        raise HTTPException(409, "清库操作已在进行中")
+
+    # Cross-process guard via Redis SET NX
+    if not await _acquire_redis_maintenance(r):
+        raise HTTPException(409, "清库操作已在进行中（其他实例）")
+
+    _maintenance_active = True
+    try:
+        async with _maintenance_lock:
+            # 1. Clear all evidence caches
+            cursor = 0
+            while True:
+                cursor, keys = await r.scan(cursor, match="session:*:evidence", count=200)
+                if keys:
+                    await r.delete(*keys)
+                if cursor == 0:
+                    break
+
+            # 2. Patch every session meta: set has_evidence=False
+            cursor = 0
+            while True:
+                cursor, meta_keys = await r.scan(cursor, match="session:*:meta", count=200)
+                for mk in meta_keys:
+                    raw = await r.get(mk)
+                    if raw is None:
+                        continue
+                    try:
+                        meta = json.loads(raw)
+                    except Exception:
+                        continue
+                    if meta.get("has_evidence"):
+                        meta["has_evidence"] = False
+                        ttl = await r.ttl(mk)
+                        await r.set(mk, json.dumps(meta), ex=max(ttl, 1) if ttl > 0 else _SESSION_TTL)
+                if cursor == 0:
+                    break
+
+            result = await asyncio.get_event_loop().run_in_executor(None, clear_report_collections)
+            result["schema_rebuilt"] = True
+            result["notice"] = "集合已重建（schema 已更新），所有历史数据已清除，请重新上传文件以应用新 schema。"
+            if result.get("schema_drift_detected"):
+                result["schema_warning"] = "重建后仍检测到 schema 漂移，请检查 schema_health 字段"
+            log.info("clear_collections_done", result=result)
+            return result
+    finally:
+        _maintenance_active = False
+        await _release_redis_maintenance(r)
+
+
+# ---------- query ----------
+
+@router.post("/query")
+async def query_report(req: QueryRequest):
+    if _maintenance_active:
+        raise HTTPException(503, "系统维护中，暂停查询，请稍后重试")
+    session_id = req.session_id or str(uuid.uuid4())
+    degraded = False
+    degrade_reason = DegradeReason.NONE
+    answer: str | None = None
+    pages: List[PageResult] = []
+    evidence_source = "new_retrieval"
+    image_fetch_incomplete = False
+
+    run_retrieval = req.use_retrieval or req.refresh_retrieval
+
+    if run_retrieval:
+        try:
+            pages = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k),
+                ),
+                timeout=settings.QUERY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log.error("query_timeout", session_id=session_id, question=req.question)
+            degraded = True
+            degrade_reason = DegradeReason.RETRIEVAL_TIMEOUT
+            pages = []
+        except Exception:
+            log.exception("query_failed", session_id=session_id, question=req.question)
+            degraded = True
+            degrade_reason = DegradeReason.RETRIEVAL_ERROR
+            pages = []
+
+        if pages:
+            await _save_evidence_cache(session_id, pages)
+        elif not degraded:
+            # Only clear cache when retrieval succeeded but returned no results
+            # (not on timeout/error), to avoid destroying valid cached evidence.
+            await _clear_evidence_cache(session_id)
+    else:
+        cached = await _load_evidence_cache(session_id)
+        cached_evidence = cached.get("evidence", []) if cached else []
+        if cached_evidence:
+            evidence_source = "cached"
+            # Reconstruct PageResult from lightweight meta + fetch images from Milvus
+            from ..core.milvus_client import get_client as _get_mc, get_pages_collection_name as _pages_col
+            page_ids = [f"{e['report_id']}_{e['page_num']}" for e in cached_evidence]
+            img_map: dict = {}
+            _milvus_ok = True
+            try:
+                meta_rows = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _get_mc().query(
+                        collection_name=_pages_col(),
+                        filter=f"page_id in {json.dumps(page_ids)}",
+                        output_fields=["report_id", "page_num", "image_base64"],
+                        limit=len(page_ids) + 1,
+                    ),
+                )
+                img_map = {(r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows}
+            except Exception:
+                _milvus_ok = False
+                image_fetch_incomplete = True
+                log.warning(
+                    "cache_reuse_image_fetch_failed",
+                    session_id=session_id,
+                    page_ids=page_ids,
+                    detail="Milvus image query failed; image_base64 will be empty, VLM quality may degrade",
+                )
+            if _milvus_ok:
+                _missing = [
+                    f"{e['report_id']}_{e['page_num']}"
+                    for e in cached_evidence
+                    if not img_map.get((e["report_id"], e["page_num"]))
+                ]
+                if _missing:
+                    image_fetch_incomplete = True
+                    log.warning(
+                        "cache_reuse_image_missing",
+                        session_id=session_id,
+                        missing_page_ids=_missing,
+                        detail="Some pages have no image_base64 in Milvus; VLM quality may degrade",
+                    )
+            pages = [
+                PageResult(
+                    report_id=e["report_id"],
+                    page_num=e["page_num"],
+                    image_base64=img_map.get((e["report_id"], e["page_num"]), ""),
+                    maxsim_score=e["maxsim_score"],
+                )
+                for e in cached_evidence
+            ]
+        else:
+            degraded = True
+            degrade_reason = DegradeReason.NO_EVIDENCE
+            evidence_source = "none"
+            answer = "当前会话尚无可复用的检索证据，请开启「检索数据」后再提问，或先进行一次检索。"
+
+    if not degraded and pages:
+        answer, vlm_reason = await generate_answer(req.question, pages)
+        if vlm_reason != DegradeReason.NONE:
+            degraded = True
+            degrade_reason = vlm_reason
+            answer = f"VLM 生成失败（{vlm_reason.value}），已找到 {len(pages)} 个相关页面，最高相关度 {pages[0].maxsim_score:.2f}（{pages[0].report_id} 第 {pages[0].page_num} 页）。"
+    elif not degraded and not pages:
+        answer = "未找到相关页面。"
+
+    evidence: list[EvidenceSummary] = [
+        EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
+        for p in pages
+    ]
+
+    hist = await _load_history(session_id)
+    hist.append({"role": "user", "content": req.question})
+    hist.append({
+        "role": "assistant",
+        "content": answer or (f"找到 {len(pages)} 个相关页面" if pages else "未找到相关页面"),
+        "degraded": degraded,
+        "degrade_reason": degrade_reason.value,
+        "evidence": [e.model_dump() for e in evidence],
+        "evidence_source": evidence_source,
+    })
+    if len(hist) > _SESSION_MAX_HISTORY:
+        hist = hist[-_SESSION_MAX_HISTORY:]
+
+    has_evidence = bool((await _load_evidence_cache(session_id) or {}).get("evidence", []))
+    await _persist_session_state(
+        session_id,
+        hist,
+        last_question=req.question,
+        has_evidence=has_evidence,
+    )
+
+    return {
+        "session_id": session_id,
+        "answer": answer,
+        "degraded": degraded,
+        "degrade_reason": degrade_reason.value,
+        "evidence": [e.model_dump() for e in evidence],
+        "evidence_source": evidence_source,
+        "image_fetch_incomplete": image_fetch_incomplete,
+        "retrieved_pages": [
+            {"report_id": p.report_id, "page_num": p.page_num, "maxsim_score": p.maxsim_score, "image_base64": p.image_base64}
+            for p in pages
+        ],
+    }
+
+
+@router.get("/{report_id}")
+async def get_report(report_id: str):
+    return {"report_id": report_id, "status": ReportStatus.PENDING}

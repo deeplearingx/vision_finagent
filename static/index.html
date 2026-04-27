@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FinAgent — 财报智能检索</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            cta: '#22C55E',
+            surface: '#0F172A',
+          },
+          fontFamily: {
+            sans: ['IBM Plex Sans', 'sans-serif'],
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    body { background:#020617; color:#F8FAFC; font-family:'IBM Plex Sans',sans-serif; }
+    .card { background:#0F172A; border:1px solid #1E293B; }
+    .msg-user { background:#1E293B; border-radius:16px 16px 4px 16px; }
+    .msg-bot { background:#0F172A; border:1px solid #1E293B; border-radius:16px 16px 16px 4px; }
+    .session-item.active { border-color:#22C55E; background:rgba(34,197,94,0.08); }
+    .typing span { display:inline-block; width:6px; height:6px; background:#22C55E; border-radius:50%; animation:bounce 1.2s infinite; }
+    .typing span:nth-child(2){animation-delay:.2s}
+    .typing span:nth-child(3){animation-delay:.4s}
+    @keyframes bounce { 0%,80%,100%{transform:translateY(0)} 40%{transform:translateY(-6px)} }
+    @media (prefers-reduced-motion:reduce) { * { transition:none!important; animation:none!important; } }
+    ::-webkit-scrollbar { width:6px; height:6px; }
+    ::-webkit-scrollbar-track { background:#0F172A; }
+    ::-webkit-scrollbar-thumb { background:#1E293B; border-radius:999px; }
+    .degrade-banner { background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.35); }
+    .source-badge { border:1px solid #334155; background:#111827; color:#CBD5E1; }
+    .source-badge.fresh { border-color:rgba(34,197,94,0.35); color:#86EFAC; }
+    .source-badge.cached { border-color:rgba(96,165,250,0.35); color:#93C5FD; }
+    .evidence-toggle { color:#94A3B8; cursor:pointer; }
+    .evidence-toggle:hover { color:#22C55E; }
+  </style>
+</head>
+<body class="min-h-screen">
+  <nav class="fixed top-3 left-3 right-3 z-50 card rounded-xl px-5 py-2.5 flex items-center justify-between">
+    <div class="flex items-center gap-2.5">
+      <svg class="w-6 h-6 text-cta" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+      </svg>
+      <div>
+        <div class="font-semibold tracking-tight">FinAgent</div>
+        <div class="text-[11px] text-slate-500">会话恢复 / 检索开关 / 证据复用</div>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <div class="flex bg-[#020617] rounded-lg p-0.5 gap-0.5">
+        <button onclick="switchTab('chat')" id="tab-chat" class="px-3 py-1 rounded-md text-xs font-medium bg-surface text-white">对话</button>
+        <button onclick="switchTab('upload')" id="tab-upload" class="px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-white">上传</button>
+      </div>
+      <button onclick="newSession()" title="新会话" class="px-3 py-1.5 rounded-lg text-xs bg-cta text-black font-semibold hover:bg-green-400 transition-colors">新会话</button>
+      <div class="flex items-center gap-1.5">
+        <span id="status-dot" class="w-2 h-2 rounded-full bg-gray-500"></span>
+        <span id="status-text" class="text-xs text-slate-400">检查中...</span>
+      </div>
+    </div>
+  </nav>
+
+  <div id="panel-chat" class="pt-[68px] h-screen">
+    <div class="h-full grid grid-cols-12 gap-4 px-3 pb-3">
+      <aside class="col-span-12 lg:col-span-3 card rounded-2xl overflow-hidden flex flex-col min-h-0">
+        <div class="px-4 py-3 border-b border-[#1E293B] flex items-center justify-between">
+          <div>
+            <div class="font-semibold text-sm">会话列表</div>
+            <div class="text-[11px] text-slate-500">刷新后自动恢复上次活跃会话</div>
+          </div>
+          <button onclick="refreshSessions(true)" class="text-xs text-slate-400 hover:text-white">刷新</button>
+        </div>
+        <div class="px-4 py-3 border-b border-[#1E293B] text-xs text-slate-400 space-y-1">
+          <div>当前会话：<span id="session-badge" class="font-mono text-slate-300">未创建</span></div>
+          <div>证据状态：<span id="evidence-status" class="text-slate-500">暂无可复用证据</span></div>
+        </div>
+        <div id="session-list" class="flex-1 overflow-y-auto p-3 space-y-2">
+          <div class="text-xs text-slate-500 px-1">暂无历史会话</div>
+        </div>
+      </aside>
+
+      <section class="col-span-12 lg:col-span-9 flex flex-col min-h-0 card rounded-2xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-[#1E293B] flex flex-wrap items-center gap-3 justify-between">
+          <div>
+            <div class="font-semibold text-sm">财报对话</div>
+            <div class="text-[11px] text-slate-500">可显式关闭本轮检索，并复用当前会话上一次证据</div>
+          </div>
+          <label class="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+            <input id="retrieval-toggle" type="checkbox" class="accent-green-500 w-4 h-4" checked>
+            <span>本轮检索数据</span>
+          </label>
+        </div>
+
+        <div class="px-4 py-2 border-b border-[#1E293B] flex flex-wrap items-center gap-2 text-xs">
+          <span class="text-slate-500">说明：</span>
+          <span class="source-badge fresh rounded-full px-2 py-1">开启时：新检索并更新证据缓存</span>
+          <span class="source-badge cached rounded-full px-2 py-1">关闭时：优先复用上次检索证据</span>
+        </div>
+
+        <div id="chat-messages" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+          <div class="flex gap-3">
+            <div class="w-7 h-7 rounded-full bg-cta/20 flex items-center justify-center flex-shrink-0 mt-1">
+              <svg class="w-4 h-4 text-cta" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10"/>
+              </svg>
+            </div>
+            <div class="msg-bot px-4 py-3 text-sm text-slate-300 max-w-3xl">
+              你好，我是 FinAgent。<br>
+              现在支持：会话列表切换、刷新后恢复上次会话、按轮次控制是否检索、复用上次检索证据。<br><br>
+              <span class="text-cta cursor-pointer hover:underline" onclick="fillQuery('JPMorgan 2024年净利润是多少？')">· JPMorgan 2024年净利润是多少？</span><br>
+              <span class="text-cta cursor-pointer hover:underline" onclick="fillQuery('继续基于上一次证据，总结核心结论')">· 继续基于上一次证据，总结核心结论</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="border-t border-[#1E293B] px-4 py-3">
+          <div class="mb-2 grid grid-cols-1 md:grid-cols-12 gap-2">
+            <input id="chat-companies" type="text" placeholder="公司过滤（可选，逗号分隔）" class="md:col-span-8 bg-[#1E293B] border border-[#334155] rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-cta placeholder-slate-600">
+            <select id="chat-topk" class="md:col-span-2 bg-[#1E293B] border border-[#334155] rounded-lg px-2 py-2 text-xs focus:outline-none focus:border-cta">
+              <option value="3">Top 3</option>
+              <option value="5" selected>Top 5</option>
+              <option value="10">Top 10</option>
+            </select>
+            <div class="md:col-span-2 flex items-center justify-start md:justify-center text-[11px] text-slate-500 px-2">
+              首轮建议开启检索
+            </div>
+          </div>
+          <div class="flex gap-2 items-end">
+            <textarea id="chat-input" rows="2" class="flex-1 bg-[#1E293B] border border-[#334155] rounded-xl px-4 py-2.5 text-sm resize-none focus:outline-none focus:border-cta placeholder-slate-600" placeholder="输入问题，Enter 发送，Shift+Enter 换行..." onkeydown="handleChatKey(event)"></textarea>
+            <button onclick="sendChat()" id="send-btn" class="bg-cta hover:bg-green-400 text-black font-semibold px-4 py-2.5 rounded-xl text-sm transition-colors flex-shrink-0">发送</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="panel-upload" class="hidden pt-20 pb-12 px-4 max-w-2xl mx-auto w-full">
+    <div class="card rounded-2xl p-6">
+      <h2 class="font-semibold mb-5 flex items-center gap-2">
+        <svg class="w-5 h-5 text-cta" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+        </svg>
+        上传财报（PDF / 图片）
+      </h2>
+      <div id="drop-zone" class="border-2 border-dashed border-slate-700 rounded-xl p-10 text-center cursor-pointer transition-colors hover:border-cta hover:bg-cta/5" onclick="document.getElementById('file-input').click()" ondragover="event.preventDefault();this.classList.add('border-cta','bg-cta/5')" ondragleave="this.classList.remove('border-cta','bg-cta/5')" ondrop="handleDrop(event)">
+        <svg class="w-10 h-10 text-slate-600 mx-auto mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/>
+        </svg>
+        <p class="text-slate-400 text-sm">拖拽文件到此处，或 <span class="text-cta">点击选择</span></p>
+        <p class="text-slate-600 text-xs mt-1">支持 PDF、PNG、JPG / JPEG、WebP</p>
+      </div>
+      <input id="file-input" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" class="hidden" onchange="handleFileSelect(event)">
+      <div id="file-info" class="hidden mt-4 p-3 bg-[#1E293B] rounded-lg flex items-center gap-3">
+        <svg class="w-5 h-5 text-cta flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+        </svg>
+        <div class="flex-1 min-w-0">
+          <p id="file-name" class="text-sm font-medium truncate"></p>
+          <p id="file-size" class="text-xs text-slate-500"></p>
+        </div>
+      </div>
+      <div class="mt-4 flex gap-3">
+        <input id="report-id" type="text" placeholder="Report ID（如 JPM_2024）" class="flex-1 bg-[#1E293B] border border-[#334155] rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-cta placeholder-slate-600">
+        <button onclick="uploadFile()" class="bg-cta hover:bg-green-400 text-black font-semibold px-5 py-2 rounded-lg text-sm transition-colors">上传</button>
+      </div>
+      <div id="upload-progress" class="hidden mt-4">
+        <div class="flex justify-between text-xs text-slate-400 mb-1">
+          <span id="upload-status">处理中...</span>
+          <span id="upload-detail" class="text-slate-500"></span>
+        </div>
+        <div class="h-1.5 bg-[#1E293B] rounded-full overflow-hidden">
+          <div id="progress-bar" class="h-full bg-cta rounded-full transition-all duration-500" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="fixed bottom-5 right-5 hidden z-50">
+    <div id="toast-inner" class="card rounded-xl px-4 py-3 text-sm flex items-center gap-3 shadow-xl">
+      <span id="toast-icon"></span><span id="toast-msg"></span>
+    </div>
+  </div>
+
+  <script>
+    const API = '';
+    const QUERY_TIMEOUT_MS = 40000;
+    const TASK_POLL_INTERVAL_MS = 1500;
+    const ACTIVE_SESSION_KEY = 'finagent.activeSessionId';
+
+    let sessionId = null;
+    let selectedFile = null;
+    let toastTimer = null;
+    let sessionsCache = [];
+    let sessionHasReusableEvidence = false;
+
+    function genId() {
+      return crypto.randomUUID ? crypto.randomUUID() : `sid_${Math.random().toString(36).slice(2)}`;
+    }
+
+    function escHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function nl2br(value) {
+      return escHtml(value).replace(/\n/g, '<br>');
+    }
+
+    function botAvatar() {
+      return `<div class="w-7 h-7 rounded-full bg-cta/20 flex items-center justify-center flex-shrink-0 mt-1">
+        <svg class="w-4 h-4 text-cta" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10"/>
+        </svg>
+      </div>`;
+    }
+
+    function switchTab(tab) {
+      document.getElementById('panel-chat').classList.toggle('hidden', tab !== 'chat');
+      document.getElementById('panel-upload').classList.toggle('hidden', tab !== 'upload');
+      document.getElementById('tab-chat').className = `px-3 py-1 rounded-md text-xs font-medium ${tab === 'chat' ? 'bg-surface text-white' : 'text-slate-400 hover:text-white'}`;
+      document.getElementById('tab-upload').className = `px-3 py-1 rounded-md text-xs font-medium ${tab === 'upload' ? 'bg-surface text-white' : 'text-slate-400 hover:text-white'}`;
+    }
+
+    async function checkHealth() {
+      try {
+        const data = await fetch(`${API}/ready`).then((r) => r.json());
+        const ok = data.status === 'ready';
+        document.getElementById('status-dot').className = `w-2 h-2 rounded-full ${ok ? 'bg-cta' : 'bg-red-500'}`;
+        document.getElementById('status-text').textContent = ok ? '服务就绪' : '服务异常';
+      } catch {
+        document.getElementById('status-dot').className = 'w-2 h-2 rounded-full bg-red-500';
+        document.getElementById('status-text').textContent = '无法连接';
+      }
+    }
+
+    function formatTime(isoString) {
+      if (!isoString) return '';
+      const date = new Date(isoString);
+      if (Number.isNaN(date.getTime())) return '';
+      return date.toLocaleString('zh-CN', { hour12: false });
+    }
+
+    function setActiveSession(nextSessionId, persist = true) {
+      sessionId = nextSessionId;
+      document.getElementById('session-badge').textContent = sessionId ? `${sessionId.slice(0, 12)}...` : '未创建';
+      if (persist && sessionId) {
+        localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
+      }
+      renderSessionList();
+    }
+
+    function updateEvidenceStatus(hasEvidence) {
+      sessionHasReusableEvidence = hasEvidence;
+      const el = document.getElementById('evidence-status');
+      if (hasEvidence) {
+        el.textContent = '已有可复用证据，关闭检索后可继续对话';
+        el.className = 'text-green-400';
+      } else {
+        el.textContent = '暂无可复用证据';
+        el.className = 'text-slate-500';
+        // Only force retrieval ON when there is no evidence at all,
+        // so the user is not silently switched to cache mode.
+        document.getElementById('retrieval-toggle').checked = true;
+      }
+    }
+
+    function clearChatToWelcome() {
+      document.getElementById('chat-messages').innerHTML = `
+        <div class="flex gap-3">
+          ${botAvatar()}
+          <div class="msg-bot px-4 py-3 text-sm text-slate-300 max-w-3xl">
+            新会话已就绪。首轮建议开启“本轮检索数据”；后续如果当前会话已存在证据，可关闭检索并复用上一次证据继续追问。
+          </div>
+        </div>`;
+    }
+
+    function renderSessionList() {
+      const wrap = document.getElementById('session-list');
+      if (!sessionsCache.length) {
+        wrap.innerHTML = '<div class="text-xs text-slate-500 px-1">暂无历史会话</div>';
+        return;
+      }
+      wrap.innerHTML = sessionsCache.map((item) => {
+        const active = item.session_id === sessionId ? 'active' : '';
+        const title = item.last_question ? escHtml(item.last_question) : '尚无提问摘要';
+        const updatedAt = formatTime(item.updated_at);
+        const evidenceBadge = item.has_evidence
+          ? '<span class="text-[10px] text-green-400">可复用证据</span>'
+          : '<span class="text-[10px] text-slate-500">无缓存证据</span>';
+        return `
+          <button onclick="loadSession('${escHtml(item.session_id)}')" class="session-item ${active} w-full text-left rounded-xl border border-[#1E293B] p-3 hover:border-[#334155] transition-colors">
+            <div class="flex items-center justify-between gap-2 mb-1">
+              <span class="font-mono text-xs text-slate-300">${escHtml(item.session_id.slice(0, 12))}...</span>
+              <span class="text-[11px] text-slate-500">${item.turn_count || 0} 轮</span>
+            </div>
+            <div class="text-[11px] text-slate-500 mb-1">${escHtml(updatedAt)}</div>
+            <div class="text-xs text-slate-400 line-clamp-2">${title}</div>
+            <div class="mt-2">${evidenceBadge}</div>
+          </button>`;
+      }).join('');
+    }
+
+    function appendUserMsg(text) {
+      const wrap = document.getElementById('chat-messages');
+      const d = document.createElement('div');
+      d.className = 'flex gap-3 justify-end';
+      d.innerHTML = `<div class="msg-user px-4 py-3 text-sm max-w-3xl whitespace-pre-wrap">${nl2br(text)}</div>`;
+      wrap.appendChild(d);
+      wrap.scrollTop = wrap.scrollHeight;
+    }
+
+    function buildDegradeBanner(degraded, reason) {
+      if (!degraded) return '';
+      const map = {
+        vlm_timeout: 'VLM 生成超时，已降级为检索结果摘要。',
+        vlm_error: 'VLM 调用失败，已降级为检索结果摘要。',
+        vlm_no_config: 'VLM 未配置，已降级为检索结果摘要。',
+        retrieval_timeout: '检索超时，请稍后重试。',
+        retrieval_error: '检索失败，请稍后重试。',
+        no_evidence: '当前会话还没有可复用证据，请开启检索后再提问。',
+        none: '服务发生降级。',
+      };
+      const text = map[reason] || map.none;
+      return `<div class="degrade-banner rounded-lg px-3 py-2 text-xs text-red-300 mt-2">⚠ ${escHtml(text)}</div>`;
+    }
+
+    function buildEvidenceHtml(evidence, pages) {
+      if (!evidence || !evidence.length) return '';
+      const id = `evd-${Math.random().toString(36).slice(2)}`;
+      const rows = evidence.map((item, idx) => {
+        const page = pages?.[idx] || {};
+        const img = page.image_base64
+          ? `<img src="data:image/png;base64,${page.image_base64}" class="w-full rounded border border-[#334155] mt-2" alt="页面预览" loading="lazy">`
+          : '<div class="mt-2 text-[11px] text-slate-500">历史会话恢复时仅保留证据摘要，本次未附带页面图像。</div>';
+        return `
+          <div class="bg-[#1E293B] rounded-lg p-3 border border-[#334155]">
+            <div class="flex items-center justify-between mb-1 gap-2">
+              <span class="text-xs font-medium text-slate-300">${escHtml(item.report_id || '-')} · 第${item.page_num ?? '-'}页</span>
+              <span class="text-xs font-mono text-cta">${typeof item.maxsim_score === 'number' ? item.maxsim_score.toFixed(2) : '-'}</span>
+            </div>
+            ${img}
+          </div>`;
+      }).join('');
+      return `
+        <div class="mt-2">
+          <div class="evidence-toggle text-xs flex items-center gap-1 select-none" onclick="toggleEvidence('${id}')">
+            <span id="${id}-icon">▸</span> 证据页面 (${evidence.length})
+          </div>
+          <div id="${id}" class="hidden mt-2 space-y-2">${rows}</div>
+        </div>`;
+    }
+
+    function buildSourceBadge(source) {
+      if (source === 'cached') {
+        return '<div class="mt-2"><span class="source-badge cached rounded-full px-2 py-1 text-[11px]">本回答复用了上一次检索结果</span></div>';
+      }
+      if (source === 'new_retrieval') {
+        return '<div class="mt-2"><span class="source-badge fresh rounded-full px-2 py-1 text-[11px]">本回答来自本轮新检索</span></div>';
+      }
+      return '';
+    }
+
+    function appendBotMsg({ answerHtml, degraded = false, degradeReason = 'none', evidence = [], pages = [], evidenceSource = null, updateEvidence = false }) {
+      const wrap = document.getElementById('chat-messages');
+      const d = document.createElement('div');
+      d.className = 'flex gap-3';
+      d.innerHTML = `${botAvatar()}<div class="msg-bot px-4 py-3 text-sm text-slate-200 max-w-3xl">${answerHtml}${buildSourceBadge(evidenceSource)}${buildDegradeBanner(degraded, degradeReason)}${buildEvidenceHtml(evidence, pages)}</div>`;
+      wrap.appendChild(d);
+      wrap.scrollTop = wrap.scrollHeight;
+      if (updateEvidence && evidence && evidence.length) {
+        updateEvidenceStatus(true);
+      }
+    }
+
+    function appendTyping() {
+      const wrap = document.getElementById('chat-messages');
+      const d = document.createElement('div');
+      d.id = 'typing-indicator';
+      d.className = 'flex gap-3';
+      d.innerHTML = `${botAvatar()}<div class="msg-bot px-4 py-3"><div class="typing"><span></span><span></span><span></span></div></div>`;
+      wrap.appendChild(d);
+      wrap.scrollTop = wrap.scrollHeight;
+    }
+
+    function removeTyping() {
+      document.getElementById('typing-indicator')?.remove();
+    }
+
+    function fillQuery(text) {
+      document.getElementById('chat-input').value = text;
+      document.getElementById('chat-input').focus();
+    }
+
+    function handleChatKey(event) {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendChat();
+      }
+    }
+
+    window.toggleEvidence = function(id) {
+      const el = document.getElementById(id);
+      const icon = document.getElementById(`${id}-icon`);
+      if (!el || !icon) return;
+      const hidden = el.classList.toggle('hidden');
+      icon.textContent = hidden ? '▸' : '▾';
+    };
+
+    async function refreshSessions(showToastAfter = false) {
+      try {
+        const data = await fetch(`${API}/reports/sessions`).then((r) => {
+          if (!r.ok) throw new Error('获取会话列表失败');
+          return r.json();
+        });
+        sessionsCache = data.sessions || [];
+        renderSessionList();
+        if (showToastAfter) {
+          showToast('success', '会话列表已刷新');
+        }
+      } catch (error) {
+        if (showToastAfter) {
+          showToast('error', error.message || '刷新会话列表失败');
+        }
+      }
+    }
+
+    async function restoreSessionOnLoad() {
+      await refreshSessions(false);
+      const saved = localStorage.getItem(ACTIVE_SESSION_KEY);
+      const existing = sessionsCache.map((item) => item.session_id);
+      if (saved && existing.includes(saved)) {
+        await loadSession(saved, false);
+        return;
+      }
+      if (sessionsCache.length) {
+        await loadSession(sessionsCache[0].session_id, false);
+        return;
+      }
+      newSession(false);
+    }
+
+    async function loadSession(targetSessionId, showToastAfter = true, { silent = false } = {}) {
+      try {
+        const [histData, evData] = await Promise.all([
+          fetch(`${API}/reports/sessions/${targetSessionId}/history`).then((r) => {
+            if (!r.ok) throw new Error('加载会话失败');
+            return r.json();
+          }),
+          fetch(`${API}/reports/sessions/${targetSessionId}/evidence-status`).then((r) =>
+            r.ok ? r.json() : { has_evidence: false }
+          ),
+        ]);
+        setActiveSession(targetSessionId, true);
+
+        const history = histData.history || [];
+        const wrap = document.getElementById('chat-messages');
+        const localUserCount = wrap.querySelectorAll('.user-msg').length;
+        const backendUserCount = history.filter((m) => m.role === 'user').length;
+
+        // Only redraw if content actually changed; skip full repaint on silent resync with same turn count
+        if (!silent || backendUserCount !== localUserCount) {
+          wrap.innerHTML = '';
+          for (const item of history) {
+            if (item.role === 'user') {
+              appendUserMsg(item.content || '');
+            } else {
+              appendBotMsg({
+                answerHtml: `<p class="whitespace-pre-wrap">${nl2br(item.content || '')}</p>`,
+                degraded: Boolean(item.degraded),
+                degradeReason: item.degrade_reason || 'none',
+                evidence: item.evidence || [],
+                pages: [],
+                evidenceSource: item.evidence_source || null,
+              });
+            }
+          }
+          if (!history.length) {
+            clearChatToWelcome();
+          }
+        }
+
+        updateEvidenceStatus(Boolean(evData.has_evidence));
+        if (showToastAfter && !silent) {
+          showToast('success', '历史会话已加载');
+        }
+      } catch (error) {
+        if (!silent) showToast('error', error.message || '加载会话失败');
+      }
+    }
+
+    function newSession(showToastAfter = true) {
+      setActiveSession(genId(), true);
+      clearChatToWelcome();
+      updateEvidenceStatus(false);
+      if (showToastAfter) {
+        showToast('success', '新会话已创建');
+      }
+    }
+
+    async function sendChat() {
+      const input = document.getElementById('chat-input');
+      const question = input.value.trim();
+      if (!question) return;
+
+      const topK = parseInt(document.getElementById('chat-topk').value, 10);
+      const companies = document.getElementById('chat-companies').value.split(',').map((s) => s.trim()).filter(Boolean);
+      const useRetrieval = document.getElementById('retrieval-toggle').checked;
+
+      input.value = '';
+      appendUserMsg(question);
+      appendTyping();
+
+      const btn = document.getElementById('send-btn');
+      btn.disabled = true;
+
+      try {
+        const body = {
+          question,
+          top_k: topK,
+          session_id: sessionId,
+          use_retrieval: useRetrieval,
+          refresh_retrieval: false,
+        };
+        if (companies.length) {
+          body.target_companies = companies;
+        }
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), QUERY_TIMEOUT_MS);
+        const response = await fetch(`${API}/reports/query`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        removeTyping();
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+
+        const data = await response.json();
+        if (data.session_id) {
+          setActiveSession(data.session_id, true);
+        }
+
+        appendBotMsg({
+          answerHtml: data.answer
+            ? `<p class="whitespace-pre-wrap">${nl2br(data.answer)}</p>`
+            : '<p class="text-slate-400 text-xs">未生成自然语言回答</p>',
+          degraded: Boolean(data.degraded),
+          degradeReason: data.degrade_reason || 'none',
+          evidence: data.evidence || [],
+          pages: data.retrieved_pages || [],
+          evidenceSource: data.evidence_source || null,
+          updateEvidence: true,
+        });
+
+        // After a live query, sync evidence status from backend truth
+        if (data.session_id) {
+          fetch(`${API}/reports/sessions/${data.session_id}/evidence-status`)
+            .then((r) => r.ok ? r.json() : { has_evidence: false })
+            .then((ev) => updateEvidenceStatus(Boolean(ev.has_evidence)))
+            .catch(() => {});
+        }
+
+        await refreshSessions(false);
+      } catch (error) {
+        removeTyping();
+        const message = error.name === 'AbortError'
+          ? '查询超时，请稍后重试；如果是首次查询，模型可能仍在预热。'
+          : `查询失败：${error.message || '未知错误'}`;
+        appendBotMsg({ answerHtml: `<span class="text-red-400">${escHtml(message)}</span>` });
+        // On timeout/abort: silently resync session state from backend so the
+        // frontend reflects any answer the backend may have already written.
+        if (error.name === 'AbortError' && sessionId) {
+          // Silent resync: loadSession will skip repaint if turn count unchanged,
+          // preventing visible flicker when backend hasn't written a new turn yet.
+          loadSession(sessionId, false, { silent: true });
+        }
+      } finally {
+        btn.disabled = false;
+        input.focus();
+      }
+    }
+
+    function handleDrop(event) {
+      event.preventDefault();
+      document.getElementById('drop-zone').classList.remove('border-cta', 'bg-cta/5');
+      const file = event.dataTransfer.files[0];
+      if (file) setFile(file);
+    }
+
+    function handleFileSelect(event) {
+      const file = event.target.files[0];
+      if (file) setFile(file);
+    }
+
+    function setFile(file) {
+      selectedFile = file;
+      document.getElementById('file-info').classList.remove('hidden');
+      document.getElementById('file-name').textContent = file.name;
+      document.getElementById('file-size').textContent = `${(file.size / 1024 / 1024).toFixed(2)} MB`;
+      if (!document.getElementById('report-id').value) {
+        document.getElementById('report-id').value = file.name.replace(/\.[^.]+$/, '').replace(/\s+/g, '_');
+      }
+    }
+
+    async function uploadFile() {
+      if (!selectedFile) return showToast('error', '请先选择文件');
+      const reportId = document.getElementById('report-id').value.trim();
+      if (!reportId) return showToast('error', '请填写 Report ID');
+
+      const fd = new FormData();
+      fd.append('file', selectedFile);
+      fd.append('report_id', reportId);
+
+      const prog = document.getElementById('upload-progress');
+      const bar = document.getElementById('progress-bar');
+      const status = document.getElementById('upload-status');
+      const detail = document.getElementById('upload-detail');
+
+      prog.classList.remove('hidden');
+      bar.style.width = '10%';
+      status.textContent = '上传中...';
+      detail.textContent = '';
+
+      try {
+        const response = await fetch(`${API}/reports/upload`, { method: 'POST', body: fd });
+        if (!response.ok) {
+          let msg;
+          try { msg = (await response.json()).detail || response.statusText; } catch { msg = await response.text(); }
+          throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+        }
+        const data = await response.json();
+        bar.style.width = '40%';
+        status.textContent = '等待处理...';
+        if (!data.task_id) {
+          throw new Error('服务器未返回任务 ID');
+        }
+        pollTask(data.task_id, bar, status, detail, prog);
+      } catch (error) {
+        bar.style.width = '0%';
+        status.textContent = '失败';
+        showToast('error', `上传失败：${error.message || '未知错误'}`);
+      }
+    }
+
+    function pollTask(taskId, bar, status, detail, prog) {
+      const doPoll = async () => {
+        try {
+          const response = await fetch(`${API}/reports/tasks/${taskId}`);
+          if (!response.ok) throw new Error('查询任务状态失败');
+          const data = await response.json();
+          if (data.status === 'pending') {
+            bar.style.width = '45%';
+            status.textContent = '等待中...';
+          } else if (data.status === 'running') {
+            bar.style.width = '65%';
+            status.textContent = '处理中...';
+          } else if (data.status === 'success') {
+            bar.style.width = '100%';
+            status.textContent = '完成';
+            detail.textContent = data.detail || '';
+            showToast('success', `${data.report_id || taskId} 处理成功`);
+            setTimeout(() => prog.classList.add('hidden'), 2500);
+            return;
+          } else if (data.status === 'failed') {
+            bar.style.width = '100%';
+            bar.classList.replace('bg-cta', 'bg-red-500');
+            status.textContent = '失败';
+            detail.textContent = data.detail || '';
+            showToast('error', `处理失败：${data.detail || '未知错误'}`);
+            setTimeout(() => {
+              bar.classList.replace('bg-red-500', 'bg-cta');
+              prog.classList.add('hidden');
+            }, 4000);
+            return;
+          }
+          setTimeout(doPoll, TASK_POLL_INTERVAL_MS);
+        } catch (error) {
+          status.textContent = '查询失败';
+          showToast('error', `轮询任务失败：${error.message || '未知错误'}`);
+        }
+      };
+      doPoll();
+    }
+
+    function showToast(type, message) {
+      const ok = type === 'success';
+      document.getElementById('toast-inner').className = `card rounded-xl px-4 py-3 text-sm flex items-center gap-3 shadow-xl border ${ok ? 'border-cta/30' : 'border-red-500/30'}`;
+      document.getElementById('toast-icon').innerHTML = ok
+        ? '<svg class="w-4 h-4 text-cta flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 13l4 4L19 7"/></svg>'
+        : '<svg class="w-4 h-4 text-red-400 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>';
+      document.getElementById('toast-msg').textContent = message;
+      document.getElementById('toast').classList.remove('hidden');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => document.getElementById('toast').classList.add('hidden'), 3500);
+    }
+
+    checkHealth();
+    setInterval(checkHealth, 30000);
+    restoreSessionOnLoad();
+  </script>
+</body>
+</html>

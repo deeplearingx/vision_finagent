@@ -1,0 +1,99 @@
+version: "3.8"
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd
+      --advertise-client-urls=http://etcd:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    networks:
+      - finagent_net
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-13T19-46-17Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - minio_data:/minio_data
+    networks:
+      - finagent_net
+
+  milvus:
+    image: milvusdb/milvus:v2.4-latest
+    command: milvus run standalone
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"
+    depends_on:
+      - etcd
+      - minio
+    volumes:
+      - milvus_data:/var/lib/milvus
+    networks:
+      - finagent_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - finagent_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      MILVUS_URI: http://milvus:19530
+      REDIS_URL: redis://redis:6379/0
+      MODEL_PATH: /models/colpali-v1.2   # mount local model here
+      VLM_API_BASE: ${VLM_API_BASE:-https://ark.cn-beijing.volces.com/api/coding/v3}
+      VLM_MODEL: ${VLM_MODEL:-Kimi-K2.6}
+      VLM_API_KEY: ${VLM_API_KEY:-EMPTY}
+    volumes:
+      - ${MODEL_DIR:-/autodl-tmp}:/models:ro   # override MODEL_DIR to local model root
+    depends_on:
+      milvus:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - finagent_net
+    restart: on-failure
+
+volumes:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  redis_data:
+
+networks:
+  finagent_net:
+    driver: bridge
