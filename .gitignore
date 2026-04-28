@@ -1,16 +1,23 @@
-# 忽略 Python 缓存
 __pycache__/
 *.py[cod]
 
-# 忽略大型权重文件
-*.pth
-*.ckpt
-*.h5
+.env
+.env.*
+!.env.example
 
-# 忽略数据集文件夹
+*.log
+logs/
+
+milvus_local.db
+*.db
+*.db.lock
+.milvus_local.db.lock
+
 data/
 datasets/
 .roo/
-# 忽略日志
-logs/
-*.logmilvus_local.db
+
+*.pth
+*.ckpt
+*.h5
+*.safetensors
