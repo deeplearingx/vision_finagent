@@ -8,7 +8,10 @@ from fastapi.staticfiles import StaticFiles
 from .core.exception import VisionFinAgentException
 from .core.milvus_client import connect_milvus, disconnect_milvus, ensure_collection
 from .core.redis_client import get_redis, close_redis
-from .services.retrieval_service import warmup_retrieval_model
+from .services.retrieval_service import (
+    warmup_retrieval_model, get_model_device, get_hf_device_map,
+    is_model_ready, is_cpu_fallback, _has_cuda_placement, _is_lora_adapter_dir,
+)
 from .routers import health, reports
 from .config import settings
 
@@ -33,13 +36,59 @@ logging.getLogger().setLevel(getattr(logging, settings.LOG_LEVEL.upper(), loggin
 log = structlog.get_logger()
 
 
+def _fix_triton_spec():
+    """修复 uvicorn worker 线程里 triton.__spec__=None 导致的 DeferredCudaCallError。
+
+    torch 在模块导入时将 _register_triton_kernels 加入 torch.cuda._queued_calls，
+    该 callback 调用 importlib.util.find_spec("triton")，而 uvicorn 线程池里
+    triton.__spec__ 已被清空，触发 ValueError → DeferredCudaCallError。
+
+    修复策略：
+    1. 先修复 triton.__spec__
+    2. 再强制触发 torch.cuda._lazy_init()，消费掉 _queued_calls，
+       使后续线程池里不再重复执行有问题的 callback。
+    """
+    try:
+        import triton as _triton, importlib as _il
+        if _triton.__spec__ is None:
+            _triton.__spec__ = _il.util.spec_from_file_location("triton", _triton.__file__)
+    except Exception:
+        pass
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.init()  # 消费 _queued_calls，避免线程池里重复触发
+            log.info("startup", msg="cuda pre-initialized, triton spec fixed")
+    except Exception as e:
+        log.warning("startup", msg=f"cuda pre-init failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     connect_milvus()
     ensure_collection()
     await get_redis()
-    app.state.retrieval_warmup_task = asyncio.create_task(asyncio.to_thread(warmup_retrieval_model))
-    log.info("startup", msg="retrieval warmup scheduled")
+    import torch
+    _fix_triton_spec()
+    cuda_available = torch.cuda.is_available()
+    log.info("startup", msg="waiting for retrieval warmup", cuda_available=cuda_available)
+    try:
+        await asyncio.to_thread(warmup_retrieval_model)
+    except Exception:
+        log.exception("startup", msg="retrieval warmup failed", cuda_available=cuda_available)
+        raise
+    model_device = get_model_device()
+    ready = is_model_ready()
+    cpu_fb = is_cpu_fallback()
+    log.info("startup", msg="retrieval warmup completed",
+             cuda_available=cuda_available,
+             explicit_gpu_path=cuda_available,
+             is_lora_adapter=_is_lora_adapter_dir(settings.MODEL_PATH),
+             hf_device_map=get_hf_device_map(),
+             has_cuda_placement=_has_cuda_placement(),
+             cpu_fallback=cpu_fb,
+             model_device=model_device,
+             model_ready=ready)
     log.info("startup", msg="connections ready")
     yield
     disconnect_milvus()

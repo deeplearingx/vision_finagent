@@ -1,8 +1,44 @@
 """Shared fixtures: fake Redis, patched model loading, FastAPI test client."""
+import sys
+import types
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
+
+
+def _inject_fake_colpali():
+    """Inject stub colpali_engine modules before any src.* import triggers the real one."""
+    if "colpali_engine" in sys.modules:
+        return
+    pkg = types.ModuleType("colpali_engine")
+    models = types.ModuleType("colpali_engine.models")
+    pali = types.ModuleType("colpali_engine.models.paligemma")
+    cp = types.ModuleType("colpali_engine.models.paligemma.colpali")
+    mcp = types.ModuleType("colpali_engine.models.paligemma.colpali.modeling_colpali")
+    pcp = types.ModuleType("colpali_engine.models.paligemma.colpali.processing_colpali")
+
+    class _FakeColPali:
+        pass
+
+    class _FakeProcessor:
+        pass
+
+    mcp.ColPali = _FakeColPali
+    pcp.ColPaliProcessor = _FakeProcessor
+
+    for name, mod in [
+        ("colpali_engine", pkg),
+        ("colpali_engine.models", models),
+        ("colpali_engine.models.paligemma", pali),
+        ("colpali_engine.models.paligemma.colpali", cp),
+        ("colpali_engine.models.paligemma.colpali.modeling_colpali", mcp),
+        ("colpali_engine.models.paligemma.colpali.processing_colpali", pcp),
+    ]:
+        sys.modules[name] = mod
+
+
+_inject_fake_colpali()
 
 
 class FakeRedis:

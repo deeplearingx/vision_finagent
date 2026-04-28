@@ -1,6 +1,18 @@
 import json
 import structlog
 from typing import List
+
+# 必须在 import torch 之前修复 triton.__spec__，
+# 否则 torch.cuda 模块级 _lazy_call(_register_triton_kernels) 会捕获损坏的 __spec__，
+# 导致 uvicorn worker 线程里触发 DeferredCudaCallError。
+try:
+    import triton as _triton
+    if _triton.__spec__ is None:
+        import importlib as _il
+        _triton.__spec__ = _il.util.spec_from_file_location("triton", _triton.__file__)
+except Exception:
+    pass
+
 import torch
 import numpy as np
 
@@ -15,19 +27,179 @@ _model: ColPali | None = None
 _processor: ColPaliProcessor | None = None
 
 
+def get_model_device() -> str | None:
+    """返回模型第一个参数所在设备字符串，模型未加载时返回 None。"""
+    if _model is None:
+        return None
+    try:
+        return str(next(_model.parameters()).device)
+    except StopIteration:
+        return "unknown"
+
+
+def get_hf_device_map() -> dict | None:
+    """返回 accelerate 注入的 hf_device_map，不存在时返回 None。"""
+    if _model is None:
+        return None
+    return getattr(_model, "hf_device_map", None)
+
+
+def _has_cuda_placement() -> bool:
+    """检查模型是否有任何层/参数实际放置在 CUDA 上。
+
+    兼容两种场景：
+    1. 单卡全量加载：首参数 device 为 cuda:N
+    2. accelerate device_map="auto" 分层加载：hf_device_map 中存在 cuda 设备
+    """
+    if _model is None:
+        return False
+    hf_map = getattr(_model, "hf_device_map", None)
+    if hf_map:
+        return any(str(v).startswith("cuda") for v in hf_map.values())
+    device = get_model_device()
+    return device is not None and device.startswith("cuda")
+
+
+def _get_input_device() -> str:
+    """解析推理输入 batch 应放置的目标设备。
+
+    accelerate device_map 分层时 model.device 不可靠（可能返回 cpu 的 embedding 层），
+    需从 hf_device_map 中找第一个 cuda 设备作为输入目标。
+
+    优先级：
+    1. hf_device_map 中第一个 cuda 设备（accelerate 分层场景）
+    2. 首参数设备（单卡全量加载）
+    3. "cpu"（CPU-only fallback）
+    """
+    if _model is None:
+        return "cpu"
+    hf_map = getattr(_model, "hf_device_map", None)
+    if hf_map:
+        for v in hf_map.values():
+            if str(v).startswith("cuda"):
+                return str(v)
+    device = get_model_device()
+    return device if device else "cpu"
+
+
+def is_cpu_fallback() -> bool:
+    """CUDA 可用但模型全在 CPU 上（降级模式）。"""
+    return _model is not None and torch.cuda.is_available() and not _has_cuda_placement()
+
+
 def is_model_ready() -> bool:
-    return _model is not None
+    """模型已加载且满足设备要求。
+
+    strict 模式（REQUIRE_RETRIEVAL_GPU=true）：CUDA 可用时必须有 CUDA 放置。
+    optional 模式（REQUIRE_RETRIEVAL_GPU=false）：CPU fallback 也视为 ready。
+    """
+    if _model is None:
+        return False
+    if torch.cuda.is_available() and not _has_cuda_placement():
+        return not settings.REQUIRE_RETRIEVAL_GPU
+    return True
+
+
+def _is_lora_adapter_dir(path: str) -> bool:
+    """判断路径是否为 LoRA adapter 目录（有 adapter_config.json 但无 config.json）。"""
+    import os
+    return (os.path.isfile(os.path.join(path, "adapter_config.json"))
+            and not os.path.isfile(os.path.join(path, "config.json")))
 
 
 def _load_model():
     global _model, _processor
-    if _model is None:
-        log.info("retrieval.model_loading", model_path=settings.MODEL_PATH)
+    if _model is not None:
+        return _model, _processor
+
+    cuda_available = torch.cuda.is_available()
+    is_lora = _is_lora_adapter_dir(settings.MODEL_PATH)
+    base_path = settings.BASE_MODEL_PATH if settings.BASE_MODEL_PATH else settings.MODEL_PATH
+
+    log.info("retrieval.model_loading",
+             model_path=settings.MODEL_PATH,
+             base_model_path=base_path,
+             is_lora_adapter=is_lora,
+             cuda_available=cuda_available)
+
+    if cuda_available:
+        # GPU strict 路径：用 device_map="cuda:0" 直接在 from_pretrained 里指定设备，
+        # 避免 .to("cuda:0") 触发 uvicorn worker 里 triton.__spec__=None 的 DeferredCudaCallError
+        try:
+            _model = ColPali.from_pretrained(
+                base_path, torch_dtype=torch.bfloat16, device_map="cuda:0"
+            ).eval()
+
+            if is_lora:
+                from peft import PeftModel
+                _model = PeftModel.from_pretrained(_model, settings.MODEL_PATH).eval()
+
+            explicit_gpu = True
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+            log.error("retrieval.gpu_load_failed",
+                      error=str(exc),
+                      msg="Explicit cuda:0 load failed — not falling back (GPU server requires GPU)")
+            raise RuntimeError(
+                f"Failed to load model on cuda:0: {exc}. "
+                "Check GPU memory. Set REQUIRE_RETRIEVAL_GPU=false to allow CPU fallback."
+            ) from exc
+    else:
+        # CPU-only 环境
+        explicit_gpu = False
         _model = ColPali.from_pretrained(
-            settings.MODEL_PATH, torch_dtype=torch.bfloat16, device_map="auto"
+            base_path, torch_dtype=torch.float32
         ).eval()
-        _processor = ColPaliProcessor.from_pretrained(settings.MODEL_PATH)
-        log.info("retrieval.model_ready", model_path=settings.MODEL_PATH)
+        if is_lora:
+            from peft import PeftModel
+            _model = PeftModel.from_pretrained(_model, settings.MODEL_PATH).eval()
+
+    _processor = ColPaliProcessor.from_pretrained(settings.MODEL_PATH)
+
+    first_param_device = get_model_device()
+    hf_device_map = getattr(_model, "hf_device_map", None)
+    on_cuda = _has_cuda_placement()
+
+    log.info("retrieval.model_placement",
+             cuda_available=cuda_available,
+             explicit_gpu_path=explicit_gpu,
+             first_param_device=first_param_device,
+             hf_device_map=hf_device_map,
+             has_cuda_placement=on_cuda,
+             is_lora_adapter=is_lora)
+
+    if cuda_available and not on_cuda:
+        if settings.REQUIRE_RETRIEVAL_GPU:
+            log.error("retrieval.model_device_mismatch",
+                      cuda_available=True,
+                      first_param_device=first_param_device,
+                      hf_device_map=hf_device_map,
+                      require_gpu=True,
+                      msg="CUDA available but no layer on GPU — failing (REQUIRE_RETRIEVAL_GPU=true)")
+            raise RuntimeError(
+                f"CUDA is available but no model layer is on CUDA "
+                f"(first_param={first_param_device}, hf_device_map={hf_device_map}). "
+                "Check GPU memory or device_map config."
+            )
+        else:
+            log.warning("retrieval.model_cpu_fallback",
+                        cuda_available=True,
+                        first_param_device=first_param_device,
+                        hf_device_map=hf_device_map,
+                        require_gpu=False,
+                        msg="CUDA available but model on CPU — degraded mode (REQUIRE_RETRIEVAL_GPU=false)")
+    elif not cuda_available:
+        log.warning("retrieval.model_cpu_fallback",
+                    cuda_available=False,
+                    first_param_device=first_param_device,
+                    msg="CUDA not available, running on CPU (degraded performance)")
+    else:
+        log.info("retrieval.model_ready",
+                 model_path=settings.MODEL_PATH,
+                 first_param_device=first_param_device,
+                 hf_device_map=hf_device_map,
+                 cuda_available=True,
+                 explicit_gpu_path=explicit_gpu)
+
     return _model, _processor
 
 
@@ -50,8 +222,11 @@ def retrieve(
 ) -> List[PageResult]:
     model, processor = _load_model()
 
+    input_device = _get_input_device()
+    log.info("retrieval.query_device", input_device=input_device,
+             hf_device_map=getattr(model, "hf_device_map", None))
     with torch.no_grad():
-        batch = processor.process_queries([query]).to(model.device)
+        batch = processor.process_queries([query]).to(input_device)
         q_emb = model(**batch)  # (1, nq, 128)
 
     q_vecs = q_emb[0].cpu().float().numpy()  # (nq, 128) — no mean pooling

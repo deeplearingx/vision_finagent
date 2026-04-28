@@ -15,9 +15,15 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
 
     MODEL_PATH: str = "vidore/colpali-v1.2"
+    # 若 MODEL_PATH 是 LoRA adapter 目录（含 adapter_config.json 但无 config.json），
+    # 则必须设置 BASE_MODEL_PATH 指向完整 base model 目录。
+    # 留空表示 MODEL_PATH 本身是完整模型（直接加载，无 LoRA）。
+    BASE_MODEL_PATH: str = ""
     VLM_API_BASE: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
     VLM_MODEL: str = "Kimi-K2.6"
     VLM_API_KEY: str = "EMPTY"
+
+    REQUIRE_RETRIEVAL_GPU: bool = False  # False = allow CPU fallback; True = fail if no CUDA placement
 
     MAX_BATCH_SIZE: int = 4
     LOG_LEVEL: str = "INFO"

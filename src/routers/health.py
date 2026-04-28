@@ -2,7 +2,9 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from ..core.milvus_client import get_client, check_schema_health
 from ..core.redis_client import get_redis
-from ..services.retrieval_service import is_model_ready
+from ..services.retrieval_service import is_model_ready, is_cpu_fallback, get_model_device, get_hf_device_map
+from ..config import settings
+import torch
 
 router = APIRouter()
 
@@ -26,9 +28,30 @@ async def ready():
         errors["redis"] = str(e)
 
     if not is_model_ready():
-        errors["retrieval_model"] = "ColPali model is still warming up"
+        device = get_model_device()
+        if device is None:
+            errors["retrieval_model"] = "ColPali model not loaded"
+        elif torch.cuda.is_available():
+            hf_map = get_hf_device_map()
+            errors["retrieval_model"] = (
+                f"ColPali: CUDA available but no layer on GPU "
+                f"(first_param={device}, hf_device_map={hf_map})"
+            )
+        else:
+            errors["retrieval_model"] = f"ColPali model not ready (device={device})"
+
     if errors:
         return JSONResponse(status_code=503, content={"status": "unavailable", "errors": errors})
+
+    # optional 模式下 CPU fallback 允许 ready，但标记 degraded
+    if is_cpu_fallback() and not settings.REQUIRE_RETRIEVAL_GPU:
+        return JSONResponse(status_code=200, content={
+            "status": "ready",
+            "degraded": True,
+            "reason": "cpu_fallback",
+            "detail": f"CUDA available but model on CPU (first_param={get_model_device()}, hf_device_map={get_hf_device_map()})",
+        })
+
     return {"status": "ready"}
 
 
