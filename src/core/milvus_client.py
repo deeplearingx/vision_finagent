@@ -116,7 +116,7 @@ def _ensure_pages_collection(client: MilvusClient, name: str) -> None:
     schema.add_field("page_id", DataType.VARCHAR, max_length=256, is_primary=True)
     schema.add_field("report_id", DataType.VARCHAR, max_length=128)
     schema.add_field("page_num", DataType.INT64)
-    schema.add_field("image_base64", DataType.VARCHAR, max_length=524288)
+    schema.add_field("image_base64", DataType.JSON)
     client.create_collection(collection_name=name, schema=schema)
 
 

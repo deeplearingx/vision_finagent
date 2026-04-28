@@ -60,9 +60,9 @@ vision_finagent/
 MILVUS_COLLECTION=fin_vision_reports_v2
 REDIS_URL=redis://localhost:6379/0
 
-# LoRA adapter 路径
+# MODEL_PATH 可为 LoRA adapter 目录或完整模型目录
 MODEL_PATH=/root/autodl-tmp/colpali-v1.2
-# 完整 base model 路径
+# 当 MODEL_PATH 是 LoRA adapter 目录时，必须设置 BASE_MODEL_PATH
 BASE_MODEL_PATH=/root/autodl-tmp/colpaligemma-3b-pt-448-base
 
 TRANSFORMERS_OFFLINE=1
@@ -72,9 +72,12 @@ VLM_API_BASE=https://ark.cn-beijing.volces.com/api/coding/v3
 VLM_MODEL=Kimi-K2.6
 VLM_API_KEY=your-key
 
+# OpenAI client 层超时
 VLM_TIMEOUT=120
+# query pipeline 层超时，必须小于 VLM_TIMEOUT
+VLM_QUERY_TIMEOUT=90
 INGEST_TIMEOUT=600
-QUERY_TIMEOUT=20
+QUERY_TIMEOUT=15
 
 # GPU 服务器默认强制检索模型驻留 GPU
 REQUIRE_RETRIEVAL_GPU=true
@@ -84,7 +87,9 @@ REQUIRE_RETRIEVAL_GPU=true
 
 - **不要**在 [`.env`](.env) 中设置 `MILVUS_URI=./milvus_local.db`
 - 本项目会通过 [`src/config.py`](src/config.py) 自动使用绝对路径形式的 Milvus Lite 文件
-- [`MODEL_PATH`](src/config.py) 现在应指向 **LoRA adapter 目录**，[`BASE_MODEL_PATH`](src/config.py) 应指向 **完整 base model 目录**
+- 当 [`MODEL_PATH`](src/config.py) 指向 **LoRA adapter 目录** 时，[`BASE_MODEL_PATH`](src/config.py) 必须指向 **完整 base model 目录**；当前版本已在 [`settings.validate_model_paths()`](src/config.py:43) 中做 fail-fast 校验
+- 当 [`MODEL_PATH`](src/config.py) 本身就是完整模型目录时，[`BASE_MODEL_PATH`](src/config.py) 可以留空
+- [`VLM_QUERY_TIMEOUT`](src/config.py:43) 必须小于 [`VLM_TIMEOUT`](src/config.py:43)，当前版本已在启动阶段做 fail-fast 校验，避免前端已超时但底层 VLM HTTP 连接仍长时间占用线程
 - 在 GPU 服务器上，默认会强制要求检索模型真正加载到 GPU；若未成功上 GPU，服务会直接启动失败，而不是静默退回 CPU
 
 ---
@@ -101,29 +106,39 @@ redis-server --daemonize yes
 
 #### 推荐启动方式
 
-当前项目新增了启动包装脚本 [`start.py`](start.py)，用于：
+当前项目统一使用 [`start.py`](start.py) 作为**标准启动入口**。它负责：
 
-- 在导入 torch 前修正当前环境下的 `triton` 启动兼容问题
-- 在 GPU 服务器上优先显式把 ColPali base model + adapter 加载到 GPU
-- 避免直接使用 `uvicorn` CLI 时出现模型错误落到 CPU、或 CUDA lazy init 异常
+- 在导入 [`torch`](start.py:1) / [`uvicorn`](start.py:13) 之前执行兼容性保护
+- 通过 [`src.main:app`](src/main.py:69) 统一触发 [`lifespan()`](src/main.py:39) 启动流程
+- 在主线程内完成 [`warmup_retrieval_model()`](src/main.py:50)，确保检索模型、Redis、Milvus 都在启动阶段完成初始化
+- 固定监听 `0.0.0.0:8000`
 
 ```bash
 cd /root/autodl-tmp/vision_finagent
 nohup python start.py > server.log 2>&1 &
 ```
 
-#### 不再推荐的启动方式
-
-以下命令在当前环境中可能触发 `triton` / CUDA lazy init 问题，因此不再作为推荐方式：
+前台调试可直接运行：
 
 ```bash
-python -m uvicorn src.main:app --host 0.0.0.0 --port 8080
+cd /root/autodl-tmp/vision_finagent
+python start.py
+```
+
+#### 不作为首选的启动方式
+
+以下命令不是当前文档推荐路径，因为它绕过了 [`start.py`](start.py) 这个统一入口，不利于复现实验结果与排查启动日志：
+
+```bash
+python -m uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
 ### 3. 验证服务状态
 
 ```bash
-curl http://localhost:8080/ready
+curl http://localhost:8000/ready
+curl http://localhost:8000/schema-health
+nvidia-smi
 ```
 
 GPU 正常加载成功时返回：
@@ -145,6 +160,7 @@ tail -f server.log
 - `hf_device_map`
 - `has_cuda_placement`
 - `cpu_fallback`
+- `model_ready`
 
 如果你在 GPU 服务器上看到模型没有任何层落在 CUDA，服务现在会直接启动失败，这是预期行为。
 
@@ -153,8 +169,28 @@ tail -f server.log
 浏览器访问：
 
 ```text
-http://<服务器IP>:8080
+http://<服务器IP>:8000
 ```
+
+### 5. 推荐启动后回归顺序
+
+```bash
+curl http://localhost:8000/ready
+curl http://localhost:8000/schema-health
+curl http://localhost:8000/reports/sessions
+```
+
+若要做完整回归，建议按以下顺序：
+
+1. 启动 Redis
+2. 使用 [`python start.py`](start.py) 启动服务
+3. 查看 [`server.log`](server.log)
+4. 查看 `nvidia-smi`
+5. 检查 [`/ready`](src/routers/health.py:17)
+6. 检查 [`/schema-health`](src/routers/health.py:58)
+7. 上传真实 PDF / 图片
+8. 轮询任务状态
+9. 执行一次真实 [`/reports/query`](src/routers/reports.py:341)
 
 ---
 
@@ -164,6 +200,7 @@ http://<服务器IP>:8080
 
 ```bash
 pkill -f "python start.py"
+
 ```
 
 ### 查看日志
@@ -193,6 +230,7 @@ redis-cli ping
 
 ```bash
 pkill -f "python start.py"
+
 ```
 
 然后重新启动服务。
@@ -238,7 +276,7 @@ tail -n 100 server.log
 如果仍然很慢，请先确认：
 
 ```bash
-curl http://localhost:8080/ready
+curl http://localhost:8000/ready
 ```
 
 ---
@@ -267,6 +305,7 @@ curl http://localhost:8080/ready
 | Method | Path | 说明 |
 |--------|------|------|
 | POST | `/reports/upload` | 上传 PDF 并异步向量化 |
+| GET | `/reports/tasks/{task_id}` | 轮询上传任务状态 |
 | POST | `/reports/query` | 页面检索查询 |
 | GET | `/reports/sessions` | 获取会话列表 |
 | GET | `/reports/sessions/{session_id}/history` | 获取对话历史 |
@@ -279,7 +318,7 @@ curl http://localhost:8080/ready
 ## 上传示例
 
 ```bash
-curl -X POST http://localhost:8080/reports/upload \
+curl -X POST http://localhost:8000/reports/upload \
   -F "file=@/root/autodl-tmp/vidore_raw/pdfs/bank_of_america_2024.pdf" \
   -F "report_id=bank_of_america_2024"
 ```
@@ -289,8 +328,15 @@ curl -X POST http://localhost:8080/reports/upload \
 ```json
 {
   "report_id": "bank_of_america_2024",
+  "task_id": "task_xxx",
   "status": "PENDING"
 }
+```
+
+轮询任务状态：
+
+```bash
+curl http://localhost:8000/reports/tasks/task_xxx
 ```
 
 ---
@@ -298,12 +344,13 @@ curl -X POST http://localhost:8080/reports/upload \
 ## 查询示例
 
 ```bash
-curl -X POST http://localhost:8080/reports/query \
+curl -X POST http://localhost:8000/reports/query \
   -H "Content-Type: application/json" \
   -d '{
     "question": "Bank of America 2024年净利润是多少？",
     "target_companies": ["bank_of_america"],
     "top_k": 3,
+    "use_retrieval": true,
     "session_id": "demo-session-001"
   }'
 ```
@@ -313,15 +360,38 @@ curl -X POST http://localhost:8080/reports/query \
 ```json
 {
   "session_id": "demo-session-001",
-  "answer": null,
-  "retrieved_pages": [
+  "answer": "...",
+  "degraded": false,
+  "degrade_reason": "none",
+  "evidence_source": "new_retrieval",
+  "evidence": [
     {
       "report_id": "bank_of_america_2024",
       "page_num": 12,
       "maxsim_score": 8.73
     }
+  ],
+  "retrieved_pages": [
+    {
+      "report_id": "bank_of_america_2024",
+      "page_num": 12,
+      "maxsim_score": 8.73,
+      "image_base64": "..."
+    }
   ]
 }
+```
+
+复用上一轮 evidence 追问：
+
+```bash
+curl -X POST http://localhost:8000/reports/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "继续基于上一次证据，总结核心结论",
+    "session_id": "demo-session-001",
+    "use_retrieval": false
+  }'
 ```
 
 ---
@@ -329,24 +399,26 @@ curl -X POST http://localhost:8080/reports/query \
 ## 会话历史示例
 
 ```bash
-curl http://localhost:8080/reports/sessions/demo-session-001/history
+curl http://localhost:8000/reports/sessions/demo-session-001/history
 ```
 
 ---
 
 ## 当前查询链路说明
 
-当前 [`/reports/query`](src/routers/reports.py) 为了保证实时性，默认走：
+当前 [`/reports/query`](src/routers/reports.py:341) 的主链路为：
 
-1. [`retrieve()`](src/services/retrieval_service.py) 做 ColPali 检索
-2. 返回页面级结果
-3. 将对话摘要保存到内存 session
+1. [`retrieve()`](src/services/retrieval_service.py:227) 做 ColPali 页面级检索
+2. 将轻量 evidence 缓存到 Redis
+3. 调用 [`generate_answer()`](src/services/vlm_service.py:64) 生成回答
+4. 若 VLM 超时或失败，则降级为 evidence 摘要，但仍返回检索结果
+5. 将历史、多轮状态、evidence 可复用状态持久化到 Redis
 
 也就是说：
 
-- 当前前端对话偏向 **检索式对话**
-- 不强制依赖 VLM 才能返回结果
-- VLM 连通性已单独验证正常
+- 当前主路径是 **检索 + VLM + evidence 返回**
+- VLM 不是硬依赖；超时会返回 `degraded=true` 与 `degrade_reason`
+- 当前会话状态不再保存在内存，而是保存在 Redis 中，支持刷新恢复与 evidence 复用
 
 ---
 
@@ -355,9 +427,14 @@ curl http://localhost:8080/reports/sessions/demo-session-001/history
 ```text
 FastAPI
 ├── /health, /ready
+├── /schema-health
 ├── /reports/upload
+├── /reports/tasks/{task_id}
 ├── /reports/query
+├── /reports/admin/clear-collections
+├── /reports/sessions
 ├── /reports/sessions/{session_id}/history
+├── /reports/sessions/{session_id}/evidence-status
 └── Static Frontend (/)
 
 Retrieval Flow
@@ -365,6 +442,8 @@ Retrieval Flow
 ├── ingestion_service
 ├── Milvus Lite patch/page collections
 ├── retrieval_service
+├── vlm_service
+├── Redis session/evidence cache
 └── Frontend chat results
 ```
 
@@ -373,5 +452,5 @@ Retrieval Flow
 ## 备注
 
 - [`src/graph/`](src/graph/) 中保留了 LangGraph 编排代码
-- 当前线上查询主路径已经优先切到更稳定的直接检索路径
-- 如果后续要恢复“检索 + VLM 回答”的完整智能问答链路，建议把 VLM 调用做成显式可选开关，而不是所有查询默认强依赖
+- 当前线上主路径已经是稳定的 [`/reports/query`](src/routers/reports.py:341) 直连链路
+- [`probe_triton_spec.py`](probe_triton_spec.py) 用于验证 [`triton.__spec__`](start.py:7) 问题是否真实存在；当前环境结论是“无法证实”，但兼容补丁仍可保留为防御性代码

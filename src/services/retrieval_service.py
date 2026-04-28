@@ -2,9 +2,8 @@ import json
 import structlog
 from typing import List
 
-# 必须在 import torch 之前修复 triton.__spec__，
-# 否则 torch.cuda 模块级 _lazy_call(_register_triton_kernels) 会捕获损坏的 __spec__，
-# 导致 uvicorn worker 线程里触发 DeferredCudaCallError。
+# 双重保障：start.py 顶部是 first-line 补丁；此处是 fallback，
+# 防止通过其他入口（如直接 uvicorn CLI）启动时 triton.__spec__ 仍为 None。
 try:
     import triton as _triton
     if _triton.__spec__ is None:
@@ -214,11 +213,34 @@ def _maxsim_score(q_vecs: np.ndarray, page_vecs: np.ndarray) -> float:
     return float(scores.max(axis=1).sum())
 
 
+def _build_company_filter(target_companies: List[str]) -> str | None:
+    """Build a Milvus filter expression for company pre-filtering.
+
+    Semantics preserved from post-filter:  rid.startswith(t + "_") or rid == t
+    Milvus supports `like` for prefix matching and `==` for exact match.
+    Multiple companies are joined with `or`.
+
+    Returns None when target_companies is empty (no filter needed).
+    """
+    if not target_companies:
+        return None
+    clauses: list[str] = []
+    for t in target_companies:
+        import json as _json
+        # prefix match: report_id starts with "<ticker>_"
+        prefix = t + "_"
+        clauses.append(f'report_id like {_json.dumps(prefix + "%")}')
+        # exact match: report_id == "<ticker>"
+        clauses.append(f'report_id == {_json.dumps(t)}')
+    return "(" + " or ".join(clauses) + ")"
+
+
 def retrieve(
     query: str,
     target_companies: List[str],
-    top_k: int = 3,
+    top_k: int = 5,   # aligned with frontend default Top-5
     candidate_k: int = 50,
+    pass_label: str = "first_pass",  # observability: "first_pass" | "second_pass"
 ) -> List[PageResult]:
     model, processor = _load_model()
 
@@ -233,8 +255,17 @@ def retrieve(
 
     client = get_client()
     name = get_collection_name()
-    # Stage 1: per-query-token ANN recall → candidate pages
-    results = client.search(
+
+    # Build company pre-filter for Milvus search stage.
+    # Pushing the filter into search() reduces ANN result set before Python-side
+    # post-processing, improving recall quality when candidate_k is fixed.
+    # Milvus `like` supports prefix wildcards; semantics match the old
+    # `startswith(t + "_") or rid == t` post-filter exactly.
+    company_filter = _build_company_filter(target_companies)
+    log.info("retrieval.company_filter", filter=company_filter,
+             target_companies=target_companies)
+
+    search_kwargs: dict = dict(
         collection_name=name,
         data=q_vecs.tolist(),
         anns_field="colpali_embeddings",
@@ -242,8 +273,15 @@ def retrieve(
         limit=candidate_k,
         output_fields=["report_id", "page_num"],
     )
+    if company_filter:
+        search_kwargs["filter"] = company_filter
 
-    # Collect unique (report_id, page_num) candidates, applying ticker filter post-search
+    # Stage 1: per-query-token ANN recall → candidate pages (company-filtered)
+    results = client.search(**search_kwargs)
+
+    # Collect unique (report_id, page_num) candidates.
+    # Python-side filter retained as safety net in case Milvus `like` semantics
+    # differ across versions (e.g. older Milvus Lite may not support `like`).
     candidates: set[tuple[str, int]] = set()
     for hits in results:
         for hit in hits:
@@ -252,7 +290,8 @@ def retrieve(
                 continue
             candidates.add((rid, hit["entity"]["page_num"]))
 
-    log.info("retrieval.candidates", count=len(candidates), query=query)
+    log.info("retrieval.candidates", count=len(candidates), query=query,
+             company_filter_applied=company_filter is not None, pass_label=pass_label)
     if not candidates:
         log.warning("retrieval.no_candidates", query=query)
         return []
@@ -313,6 +352,6 @@ def retrieve(
 
     scored.sort(key=lambda x: x.maxsim_score, reverse=True)
     result = scored[:top_k]
-    log.info("retrieval.done", returned=len(result),
+    log.info("retrieval.done", returned=len(result), pass_label=pass_label,
              top_score=result[0].maxsim_score if result else None)
     return result

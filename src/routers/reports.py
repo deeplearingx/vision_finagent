@@ -17,7 +17,10 @@ from ..models.schema import PageResult, EvidenceSummary
 from ..models.enums import ReportStatus, DegradeReason
 from ..utils.idempotency import check_and_set
 from ..services.retrieval_service import retrieve
-from ..services.vlm_service import generate_answer
+from ..services.vlm_service import (
+    generate_answer, is_insufficient_evidence,
+    is_market_like_question, MARKET_BOUNDARY_HINT,
+)
 from ..services.task_service import submit_ingest_task, get_task
 from ..core.redis_client import get_redis
 from ..core.milvus_client import clear_report_collections
@@ -351,13 +354,15 @@ async def query_report(req: QueryRequest):
     image_fetch_incomplete = False
 
     run_retrieval = req.use_retrieval or req.refresh_retrieval
+    vlm_passes = 0
+    second_pass_triggered = False
 
     if run_retrieval:
         try:
             pages = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k),
+                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass"),
                 ),
                 timeout=settings.QUERY_TIMEOUT,
             )
@@ -438,11 +443,98 @@ async def query_report(req: QueryRequest):
             answer = "当前会话尚无可复用的检索证据，请开启「检索数据」后再提问，或先进行一次检索。"
 
     if not degraded and pages:
+        t0 = time.monotonic()
         answer, vlm_reason = await generate_answer(req.question, pages)
-        if vlm_reason != DegradeReason.NONE:
+        vlm_passes = 1
+        first_pass_elapsed = round(time.monotonic() - t0, 3)
+        log.info(
+            "vlm.first_pass_done",
+            session_id=session_id,
+            pages=len(pages),
+            elapsed=first_pass_elapsed,
+            vlm_reason=vlm_reason.value,
+            answer_preview=(answer or "")[:80],
+        )
+
+        # Second-pass: only when VLM explicitly signals insufficient evidence
+        if (
+            vlm_reason == DegradeReason.NONE
+            and settings.VLM_SECOND_PASS_ENABLED
+            and is_insufficient_evidence(answer)
+        ):
+            second_pass_triggered = True
+            log.info(
+                "vlm.second_pass_triggered",
+                session_id=session_id,
+                first_pass_pages=len(pages),
+                expanded_top_k=settings.VLM_SECOND_PASS_TOP_K,
+                expanded_candidate_k=settings.VLM_SECOND_PASS_CANDIDATE_K,
+            )
+            t1 = time.monotonic()
+            try:
+                pages2 = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: retrieve(
+                            req.question,
+                            req.target_companies,
+                            settings.VLM_SECOND_PASS_TOP_K,
+                            settings.VLM_SECOND_PASS_CANDIDATE_K,
+                            "second_pass",
+                        ),
+                    ),
+                    timeout=settings.QUERY_TIMEOUT,
+                )
+            except Exception:
+                log.exception("vlm.second_pass_retrieval_failed", session_id=session_id)
+                pages2 = []
+
+            if pages2:
+                # Temporarily cap images for second pass
+                import copy
+                pages2_capped = pages2[: settings.VLM_SECOND_PASS_MAX_IMAGES]
+                answer2, vlm_reason2 = await generate_answer(req.question, pages2_capped)
+                vlm_passes = 2
+                second_pass_elapsed = round(time.monotonic() - t1, 3)
+                log.info(
+                    "vlm.second_pass_done",
+                    session_id=session_id,
+                    pages=len(pages2_capped),
+                    elapsed=second_pass_elapsed,
+                    vlm_reason=vlm_reason2.value,
+                    answer_preview=(answer2 or "")[:80],
+                )
+                if vlm_reason2 == DegradeReason.NONE and answer2:
+                    # Second pass succeeded — use its answer and pages
+                    answer = answer2
+                    pages = pages2
+                    evidence_source = "second_pass"
+                else:
+                    # Second pass failed — keep first-pass answer (degraded semantics preserved)
+                    log.warning(
+                        "vlm.second_pass_no_improvement",
+                        session_id=session_id,
+                        vlm_reason2=vlm_reason2.value,
+                    )
+            else:
+                log.warning("vlm.second_pass_no_pages", session_id=session_id)
+
+        if vlm_reason != DegradeReason.NONE and not second_pass_triggered:
             degraded = True
             degrade_reason = vlm_reason
             answer = f"VLM 生成失败（{vlm_reason.value}），已找到 {len(pages)} 个相关页面，最高相关度 {pages[0].maxsim_score:.2f}（{pages[0].report_id} 第 {pages[0].page_num} 页）。"
+
+        # Soft market-boundary hint: append only when evidence is still insufficient
+        # after all passes AND the question looks market/price-trend oriented.
+        # Never blocks retrieval or VLM — purely additive to the answer text.
+        if (
+            answer
+            and is_insufficient_evidence(answer)
+            and is_market_like_question(req.question)
+        ):
+            answer = answer + MARKET_BOUNDARY_HINT
+            log.info("vlm.market_boundary_hint_appended", session_id=session_id, question=req.question)
+
     elif not degraded and not pages:
         answer = "未找到相关页面。"
 
@@ -484,6 +576,10 @@ async def query_report(req: QueryRequest):
             {"report_id": p.report_id, "page_num": p.page_num, "maxsim_score": p.maxsim_score, "image_base64": p.image_base64}
             for p in pages
         ],
+        # Observability fields (additive — no existing field removed)
+        "vlm_passes": vlm_passes,
+        "second_pass_triggered": second_pass_triggered,
+        "evidence_source_detail": evidence_source,
     }
 
 

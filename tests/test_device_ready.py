@@ -358,25 +358,17 @@ def test_is_lora_adapter_dir_false_empty(monkeypatch, tmp_path):
 # _load_model — GPU strict 路径（显式 cuda:0）
 # ---------------------------------------------------------------------------
 
-def _make_gpu_model_cls():
-    """首参数在 cpu，.to(device) 更新设备 → 模拟显式 cuda:0 加载成功。"""
-    class _M(_FakeModel):
-        def to(self, device):
-            self._device_str = device
-            return self
-        def eval(self): return self
-        @classmethod
-        def from_pretrained(cls, *a, **kw): return cls("cpu")
-    return _M
-
-
 class _FakeProcessorCls:
     @classmethod
     def from_pretrained(cls, *a, **kw): return cls()
 
 
 def test_load_model_explicit_gpu_success(monkeypatch, tmp_path):
-    """GPU 可用 + 非 LoRA 目录 → 显式 cuda:0 加载成功 → first_param_device=cuda:0。"""
+    """GPU 可用 + 非 LoRA 目录 → from_pretrained(device_map='cuda:0') → first_param_device=cuda:0。
+
+    _load_model 使用 device_map='cuda:0' 参数，模型由 HuggingFace 内部放置到 GPU，
+    不经过 .to()。因此 fake ColPali.from_pretrained 直接返回首参数在 cuda:0 的模型。
+    """
     (tmp_path / "config.json").write_text("{}")
     svc = _import_service(monkeypatch)
     monkeypatch.setattr(svc.settings, "MODEL_PATH", str(tmp_path))
@@ -384,8 +376,16 @@ def test_load_model_explicit_gpu_success(monkeypatch, tmp_path):
     monkeypatch.setattr(svc.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(svc, "_model", None)
     monkeypatch.setattr(svc, "_processor", None)
-    # patch ColPali/ColPaliProcessor 在 svc 模块命名空间（已 import 绑定）
-    monkeypatch.setattr(svc, "ColPali", _make_gpu_model_cls())
+
+    class _GpuModel(_FakeModel):
+        def eval(self): return self
+        @classmethod
+        def from_pretrained(cls, *a, **kw):
+            # device_map="cuda:0" → HuggingFace places params on cuda:0
+            assert kw.get("device_map") == "cuda:0", f"expected device_map=cuda:0, got {kw}"
+            return cls("cuda:0")
+
+    monkeypatch.setattr(svc, "ColPali", _GpuModel)
     monkeypatch.setattr(svc, "ColPaliProcessor", _FakeProcessorCls)
 
     svc._load_model()
@@ -393,7 +393,7 @@ def test_load_model_explicit_gpu_success(monkeypatch, tmp_path):
 
 
 def test_load_model_gpu_oom_raises(monkeypatch, tmp_path):
-    """GPU 可用但 OOM → 抛 RuntimeError，不静默 fallback 到 CPU。"""
+    """GPU 可用但 from_pretrained 抛 OOM → RuntimeError，不静默 fallback 到 CPU。"""
     (tmp_path / "config.json").write_text("{}")
     svc = _import_service(monkeypatch)
     monkeypatch.setattr(svc.settings, "MODEL_PATH", str(tmp_path))
@@ -403,10 +403,10 @@ def test_load_model_gpu_oom_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(svc, "_processor", None)
 
     class _OOM:
-        def to(self, device): raise svc.torch.cuda.OutOfMemoryError("OOM")
         def eval(self): return self
         @classmethod
-        def from_pretrained(cls, *a, **kw): return cls()
+        def from_pretrained(cls, *a, **kw):
+            raise svc.torch.cuda.OutOfMemoryError("OOM")
 
     monkeypatch.setattr(svc, "ColPali", _OOM)
     monkeypatch.setattr(svc, "ColPaliProcessor", _FakeProcessorCls)
@@ -436,3 +436,111 @@ def test_load_model_cpu_only_env(monkeypatch, tmp_path):
 
     svc._load_model()
     assert svc.get_model_device() == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# _load_model — LoRA adapter + base model 路径
+# ---------------------------------------------------------------------------
+
+def test_load_model_lora_gpu_uses_base_model_path(monkeypatch, tmp_path):
+    """LoRA adapter 目录 + GPU → 先用 BASE_MODEL_PATH 加载 base，再加载 adapter。"""
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / "config.json").write_text("{}")
+
+    svc = _import_service(monkeypatch)
+    monkeypatch.setattr(svc.settings, "MODEL_PATH", str(adapter_dir))
+    monkeypatch.setattr(svc.settings, "BASE_MODEL_PATH", str(base_dir))
+    monkeypatch.setattr(svc.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(svc, "_model", None)
+    monkeypatch.setattr(svc, "_processor", None)
+
+    loaded_paths = []
+
+    class _BaseModel(_FakeModel):
+        def eval(self): return self
+        @classmethod
+        def from_pretrained(cls, path, **kw):
+            loaded_paths.append(("base", path, kw.get("device_map")))
+            return cls("cuda:0")
+
+    class _PeftModel(_FakeModel):
+        def eval(self): return self
+        @classmethod
+        def from_pretrained(cls, base_model, adapter_path, **kw):
+            loaded_paths.append(("peft", adapter_path))
+            return cls("cuda:0")
+
+    import types
+    fake_peft = types.ModuleType("peft")
+    fake_peft.PeftModel = _PeftModel
+    monkeypatch.setitem(__import__("sys").modules, "peft", fake_peft)
+    monkeypatch.setattr(svc, "ColPali", _BaseModel)
+    monkeypatch.setattr(svc, "ColPaliProcessor", _FakeProcessorCls)
+
+    svc._load_model()
+
+    assert loaded_paths[0] == ("base", str(base_dir), "cuda:0"), \
+        f"base model must be loaded with device_map=cuda:0, got {loaded_paths}"
+    assert loaded_paths[1][0] == "peft"
+    assert loaded_paths[1][1] == str(adapter_dir)
+
+
+def test_load_model_lora_cpu_uses_base_model_path(monkeypatch, tmp_path):
+    """LoRA adapter 目录 + CPU-only → base model 用 float32 加载，再加载 adapter。"""
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}")
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / "config.json").write_text("{}")
+
+    svc = _import_service(monkeypatch)
+    monkeypatch.setattr(svc.settings, "MODEL_PATH", str(adapter_dir))
+    monkeypatch.setattr(svc.settings, "BASE_MODEL_PATH", str(base_dir))
+    monkeypatch.setattr(svc.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(svc, "_model", None)
+    monkeypatch.setattr(svc, "_processor", None)
+
+    loaded_paths = []
+
+    class _BaseModel(_FakeModel):
+        def eval(self): return self
+        @classmethod
+        def from_pretrained(cls, path, **kw):
+            loaded_paths.append(("base", path))
+            return cls("cpu")
+
+    class _PeftModel(_FakeModel):
+        def eval(self): return self
+        @classmethod
+        def from_pretrained(cls, base_model, adapter_path, **kw):
+            loaded_paths.append(("peft", adapter_path))
+            return cls("cpu")
+
+    import types
+    fake_peft = types.ModuleType("peft")
+    fake_peft.PeftModel = _PeftModel
+    monkeypatch.setitem(__import__("sys").modules, "peft", fake_peft)
+    monkeypatch.setattr(svc, "ColPali", _BaseModel)
+    monkeypatch.setattr(svc, "ColPaliProcessor", _FakeProcessorCls)
+
+    svc._load_model()
+    assert loaded_paths[0] == ("base", str(base_dir))
+    assert loaded_paths[1] == ("peft", str(adapter_dir))
+
+
+# ---------------------------------------------------------------------------
+# warmup_retrieval_model — 主线程同步语义
+# ---------------------------------------------------------------------------
+
+def test_warmup_calls_load_model(monkeypatch):
+    """warmup_retrieval_model() 是 _load_model() 的同步薄包装，不涉及线程池。"""
+    svc = _import_service(monkeypatch)
+    called = []
+    monkeypatch.setattr(svc, "_load_model", lambda: called.append(True))
+    svc.warmup_retrieval_model()
+    assert called == [True], "warmup_retrieval_model must call _load_model synchronously"
