@@ -4,16 +4,17 @@ import io
 import time
 import re
 import structlog
-from typing import List
+from typing import List, AsyncGenerator
 
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from ..config import settings
 from ..models.schema import PageResult
 from ..models.enums import DegradeReason
 
 log = structlog.get_logger()
 _client: OpenAI | None = None
+_async_client: AsyncOpenAI | None = None
 
 
 # Sentinel value indicating no real key is configured
@@ -40,6 +41,17 @@ def _get_client() -> OpenAI:
             timeout=settings.VLM_TIMEOUT,
         )
     return _client
+
+
+def _get_async_client() -> AsyncOpenAI:
+    global _async_client
+    if _async_client is None:
+        _async_client = AsyncOpenAI(
+            base_url=settings.VLM_API_BASE,
+            api_key=settings.VLM_API_KEY,
+            timeout=settings.VLM_TIMEOUT,
+        )
+    return _async_client
 
 
 # Financial document analysis instruction prepended to every VLM query.
@@ -214,6 +226,66 @@ def _call_vlm_sync(query: str, pages: List[PageResult]) -> str:
             else:
                 raise
     raise last_exc  # unreachable but satisfies type checker
+
+
+async def _call_vlm_async_stream(
+    query: str,
+    pages: List[PageResult],
+) -> AsyncGenerator[str, None]:
+    """Asynchronous streaming VLM call with connection-level retry."""
+    client = _get_async_client()
+    messages = _build_messages(query, pages)
+    max_attempts = settings.VLM_RETRY_MAX_ATTEMPTS if settings.VLM_RETRY_ENABLED else 1
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=settings.VLM_MODEL,
+                    messages=messages,
+                    max_tokens=1024,
+                    stream=True,
+                ),
+                timeout=settings.VLM_QUERY_TIMEOUT,
+            )
+            if attempt > 1:
+                log.info("vlm.retry_succeeded", attempt=attempt, query=query)
+            async for chunk in response:
+                delta = chunk.choices[0].delta.content if (chunk.choices and chunk.choices[0].delta) else None
+                if delta:
+                    yield delta
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts and _is_connection_error(exc):
+                log.warning("vlm.retry_scheduled", attempt=attempt, error=str(exc), query=query)
+                await asyncio.sleep(settings.VLM_RETRY_BACKOFF_SECONDS)
+            else:
+                raise
+    raise last_exc  # unreachable but satisfies type checker
+
+
+async def stream_generate_answer(
+    query: str,
+    pages: List[PageResult],
+) -> AsyncGenerator[str, None]:
+    """Stream VLM answer with retrieved pages and return chunk strings.
+
+    If config is missing or pages are empty, yields nothing.
+    Any exception propagates to the caller (StreamingResponse) so it can be
+    translated into an SSE error event.
+    """
+    if not pages:
+        return
+
+    config_err = _check_vlm_config()
+    if config_err:
+        log.warning("vlm.config_missing", reason=config_err, query=query)
+        return
+
+    log.info("vlm.stream_start", query=query, images=min(len(pages), settings.MAX_VLM_IMAGES))
+    async for delta in _call_vlm_async_stream(query, pages):
+        yield delta
 
 
 async def generate_answer(

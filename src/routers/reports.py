@@ -10,6 +10,7 @@ from typing import Any, List
 
 from ..config import settings
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 log = structlog.get_logger()
@@ -20,6 +21,7 @@ from ..services.retrieval_service import retrieve
 from ..services.vlm_service import (
     generate_answer, is_insufficient_evidence,
     is_market_like_question, MARKET_BOUNDARY_HINT,
+    stream_generate_answer,
 )
 from ..services.task_service import submit_ingest_task, get_task
 from ..core.redis_client import get_redis
@@ -268,6 +270,19 @@ async def get_session_evidence_status(session_id: str):
     evidence_cache = await _load_evidence_cache(session_id)
     has_evidence = bool(evidence_cache and evidence_cache.get("evidence"))
     return {"session_id": session_id, "has_evidence": has_evidence}
+
+
+@router.delete("/sessions/{session_id}", status_code=200)
+async def delete_session(session_id: str):
+    """Delete a session and all its associated Redis keys."""
+    r = await get_redis()
+    await r.delete(
+        f"session:{session_id}",
+        f"session:{session_id}:meta",
+        f"session:{session_id}:evidence",
+    )
+    await r.zrem(_SESSION_INDEX_KEY, session_id)
+    return {"session_id": session_id, "deleted": True}
 
 
 _MAINTENANCE_REDIS_KEY = "maintenance:clear_collections"
@@ -581,6 +596,290 @@ async def query_report(req: QueryRequest):
         "second_pass_triggered": second_pass_triggered,
         "evidence_source_detail": evidence_source,
     }
+
+
+@router.post("/query/stream")
+async def query_report_stream(req: QueryRequest):
+    async def sse_generator():
+        session_id = req.session_id or str(uuid.uuid4())
+        degraded = False
+        degrade_reason = DegradeReason.NONE
+        answer: str | None = None
+        pages: List[PageResult] = []
+        evidence_source = "new_retrieval"
+        image_fetch_incomplete = False
+
+        run_retrieval = req.use_retrieval or req.refresh_retrieval
+        vlm_passes = 0
+        second_pass_triggered = False
+
+        try:
+            if _maintenance_active:
+                yield f"event: error\ndata: {json.dumps({'code': 'maintenance', 'message': '系统维护中，暂停查询，请稍后重试'})}\n\n"
+                return
+
+            # --- meta event ---
+            yield f"event: meta\ndata: {json.dumps({'session_id': session_id, 'degraded': degraded, 'vlm_passes': vlm_passes, 'second_pass_triggered': second_pass_triggered})}\n\n"
+
+            # --- retrieval logic (mirrors /query exactly) ---
+            if run_retrieval:
+                try:
+                    pages = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass"),
+                        ),
+                        timeout=settings.QUERY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.error("query_timeout", session_id=session_id, question=req.question)
+                    degraded = True
+                    degrade_reason = DegradeReason.RETRIEVAL_TIMEOUT
+                    pages = []
+                except Exception:
+                    log.exception("query_failed", session_id=session_id, question=req.question)
+                    degraded = True
+                    degrade_reason = DegradeReason.RETRIEVAL_ERROR
+                    pages = []
+
+                if pages:
+                    await _save_evidence_cache(session_id, pages)
+                elif not degraded:
+                    await _clear_evidence_cache(session_id)
+            else:
+                cached = await _load_evidence_cache(session_id)
+                cached_evidence = cached.get("evidence", []) if cached else []
+                if cached_evidence:
+                    evidence_source = "cached"
+                    from ..core.milvus_client import get_client as _get_mc, get_pages_collection_name as _pages_col
+                    page_ids = [f"{e['report_id']}_{e['page_num']}" for e in cached_evidence]
+                    img_map: dict = {}
+                    _milvus_ok = True
+                    try:
+                        meta_rows = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: _get_mc().query(
+                                collection_name=_pages_col(),
+                                filter=f"page_id in {json.dumps(page_ids)}",
+                                output_fields=["report_id", "page_num", "image_base64"],
+                                limit=len(page_ids) + 1,
+                            ),
+                        )
+                        img_map = {(r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows}
+                    except Exception:
+                        _milvus_ok = False
+                        image_fetch_incomplete = True
+                        log.warning(
+                            "cache_reuse_image_fetch_failed",
+                            session_id=session_id,
+                            page_ids=page_ids,
+                            detail="Milvus image query failed; image_base64 will be empty, VLM quality may degrade",
+                        )
+                    if _milvus_ok:
+                        _missing = [
+                            f"{e['report_id']}_{e['page_num']}"
+                            for e in cached_evidence
+                            if not img_map.get((e["report_id"], e["page_num"]))
+                        ]
+                        if _missing:
+                            image_fetch_incomplete = True
+                            log.warning(
+                                "cache_reuse_image_missing",
+                                session_id=session_id,
+                                missing_page_ids=_missing,
+                                detail="Some pages have no image_base64 in Milvus; VLM quality may degrade",
+                            )
+                    pages = [
+                        PageResult(
+                            report_id=e["report_id"],
+                            page_num=e["page_num"],
+                            image_base64=img_map.get((e["report_id"], e["page_num"]), ""),
+                            maxsim_score=e["maxsim_score"],
+                        )
+                        for e in cached_evidence
+                    ]
+                else:
+                    degraded = True
+                    degrade_reason = DegradeReason.NO_EVIDENCE
+                    evidence_source = "none"
+                    answer = "当前会话尚无可复用的检索证据，请开启「检索数据」后再提问，或先进行一次检索。"
+
+            evidence: list[EvidenceSummary] = [
+                EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
+                for p in pages
+            ]
+
+            # --- evidence event ---
+            yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence]})}\n\n"
+
+            if not degraded and pages:
+                # First pass streaming
+                t0 = time.monotonic()
+                first_pass_answer = ""
+                try:
+                    async for chunk in stream_generate_answer(req.question, pages):
+                        first_pass_answer += chunk
+                        yield f"event: content\ndata: {json.dumps({'chunk': chunk})}\n\n"
+                except asyncio.TimeoutError:
+                    log.warning("vlm.stream_timeout", session_id=session_id, query=req.question)
+                    yield f"event: error\ndata: {json.dumps({'code': 'vlm_timeout', 'message': 'VLM 生成超时'})}\n\n"
+                    return
+                except Exception as exc:
+                    log.error("vlm.stream_error", session_id=session_id, error=str(exc))
+                    yield f"event: error\ndata: {json.dumps({'code': 'vlm_error', 'message': str(exc)})}\n\n"
+                    return
+
+                vlm_passes = 1
+                answer = first_pass_answer
+                first_pass_elapsed = round(time.monotonic() - t0, 3)
+                log.info(
+                    "vlm.first_pass_stream_done",
+                    session_id=session_id,
+                    pages=len(pages),
+                    elapsed=first_pass_elapsed,
+                    answer_preview=(answer or "")[:80],
+                )
+
+                if not answer or len(answer) < 5:
+                    degraded = True
+                    degrade_reason = DegradeReason.VLM_ERROR
+                    answer = f"VLM 生成失败（{DegradeReason.VLM_ERROR.value}），已找到 {len(pages)} 个相关页面，最高相关度 {pages[0].maxsim_score:.2f}（{pages[0].report_id} 第 {pages[0].page_num} 页）。"
+                    yield f"event: content\ndata: {json.dumps({'chunk': answer})}\n\n"
+
+                # Second pass
+                if (
+                    settings.VLM_SECOND_PASS_ENABLED
+                    and is_insufficient_evidence(answer)
+                ):
+                    second_pass_triggered = True
+                    yield f"event: second_pass\ndata: {json.dumps({})}\n\n"
+                    log.info(
+                        "vlm.second_pass_triggered",
+                        session_id=session_id,
+                        first_pass_pages=len(pages),
+                        expanded_top_k=settings.VLM_SECOND_PASS_TOP_K,
+                        expanded_candidate_k=settings.VLM_SECOND_PASS_CANDIDATE_K,
+                    )
+                    t1 = time.monotonic()
+                    try:
+                        pages2 = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: retrieve(
+                                    req.question,
+                                    req.target_companies,
+                                    settings.VLM_SECOND_PASS_TOP_K,
+                                    settings.VLM_SECOND_PASS_CANDIDATE_K,
+                                    "second_pass",
+                                ),
+                            ),
+                            timeout=settings.QUERY_TIMEOUT,
+                        )
+                    except Exception:
+                        log.exception("vlm.second_pass_retrieval_failed", session_id=session_id)
+                        pages2 = []
+
+                    if pages2:
+                        pages2_capped = pages2[: settings.VLM_SECOND_PASS_MAX_IMAGES]
+                        # New evidence
+                        evidence = [
+                            EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
+                            for p in pages2
+                        ]
+                        yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence]})}\n\n"
+
+                        second_pass_answer = ""
+                        try:
+                            async for chunk in stream_generate_answer(req.question, pages2_capped):
+                                second_pass_answer += chunk
+                                yield f"event: content\ndata: {json.dumps({'chunk': chunk})}\n\n"
+                        except asyncio.TimeoutError:
+                            log.warning("vlm.second_stream_timeout", session_id=session_id)
+                            yield f"event: error\ndata: {json.dumps({'code': 'vlm_timeout', 'message': 'VLM 二轮生成超时'})}\n\n"
+                            return
+                        except Exception as exc:
+                            log.error("vlm.second_stream_error", session_id=session_id, error=str(exc))
+                            yield f"event: error\ndata: {json.dumps({'code': 'vlm_error', 'message': str(exc)})}\n\n"
+                            return
+
+                        vlm_passes = 2
+                        answer = second_pass_answer
+                        evidence_source = "second_pass"
+                        pages = pages2
+                        second_pass_elapsed = round(time.monotonic() - t1, 3)
+                        log.info(
+                            "vlm.second_pass_stream_done",
+                            session_id=session_id,
+                            pages=len(pages2_capped),
+                            elapsed=second_pass_elapsed,
+                            answer_preview=(answer or "")[:80],
+                        )
+                    else:
+                        log.warning("vlm.second_pass_no_pages", session_id=session_id)
+
+                if (
+                    answer
+                    and is_insufficient_evidence(answer)
+                    and is_market_like_question(req.question)
+                ):
+                    answer = answer + MARKET_BOUNDARY_HINT
+                    yield f"event: content\ndata: {json.dumps({'chunk': MARKET_BOUNDARY_HINT})}\n\n"
+                    log.info("vlm.market_boundary_hint_appended", session_id=session_id, question=req.question)
+
+            elif not degraded and not pages:
+                answer = "未找到相关页面。"
+                evidence_source = "none"
+                yield f"event: content\ndata: {json.dumps({'chunk': answer})}\n\n"
+
+            if degraded and answer and not vlm_passes:
+                evidence_source = "none"
+                yield f"event: content\ndata: {json.dumps({'chunk': answer})}\n\n"
+
+            # Rebuild evidence with final pages
+            evidence = [
+                EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
+                for p in pages
+            ]
+
+            # --- done event ---
+            done_payload = {
+                "session_id": session_id,
+                "degraded": degraded,
+                "degrade_reason": degrade_reason.value,
+                "evidence_source": evidence_source,
+                "vlm_passes": vlm_passes,
+                "second_pass_triggered": second_pass_triggered,
+                "image_fetch_incomplete": image_fetch_incomplete,
+            }
+            yield f"event: done\ndata: {json.dumps(done_payload)}\n\n"
+
+            # --- persist to Redis (after stream ends) ---
+            hist = await _load_history(session_id)
+            hist.append({"role": "user", "content": req.question})
+            hist.append({
+                "role": "assistant",
+                "content": answer or (f"找到 {len(pages)} 个相关页面" if pages else "未找到相关页面"),
+                "degraded": degraded,
+                "degrade_reason": degrade_reason.value,
+                "evidence": [e.model_dump() for e in evidence],
+                "evidence_source": evidence_source,
+            })
+            if len(hist) > _SESSION_MAX_HISTORY:
+                hist = hist[-_SESSION_MAX_HISTORY:]
+
+            has_evidence = bool((await _load_evidence_cache(session_id) or {}).get("evidence", []))
+            await _persist_session_state(
+                session_id,
+                hist,
+                last_question=req.question,
+                has_evidence=has_evidence,
+            )
+
+        except Exception as exc:
+            log.error("stream_fatal_error", session_id=session_id, error=str(exc))
+            yield f"event: error\ndata: {json.dumps({'code': 'internal_error', 'message': str(exc)})}\n\n"
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
 
 @router.get("/{report_id}")

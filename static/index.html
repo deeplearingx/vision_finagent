@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FinAgent — 财报智能检索</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <script>
     tailwind.config = {
@@ -135,7 +136,7 @@
           </div>
           <div class="flex gap-2 items-end">
             <textarea id="chat-input" rows="2" class="flex-1 bg-[#1E293B] border border-[#334155] rounded-xl px-4 py-2.5 text-sm resize-none focus:outline-none focus:border-cta placeholder-slate-600" placeholder="输入问题，Enter 发送，Shift+Enter 换行..." onkeydown="handleChatKey(event)"></textarea>
-            <button onclick="sendChat()" id="send-btn" class="bg-cta hover:bg-green-400 text-black font-semibold px-4 py-2.5 rounded-xl text-sm transition-colors flex-shrink-0">发送</button>
+            <button onclick="handleSendClick()" id="send-btn" class="bg-cta hover:bg-green-400 text-black font-semibold px-4 py-2.5 rounded-xl text-sm transition-colors flex-shrink-0">发送</button>
           </div>
         </div>
       </section>
@@ -200,6 +201,8 @@
     let toastTimer = null;
     let sessionsCache = [];
     let sessionHasReusableEvidence = false;
+    let isStreaming = false;
+    let streamAbortController = null;
 
     function genId() {
       return crypto.randomUUID ? crypto.randomUUID() : `sid_${Math.random().toString(36).slice(2)}`;
@@ -299,9 +302,11 @@
         const evidenceBadge = item.has_evidence
           ? '<span class="text-[10px] text-green-400">可复用证据</span>'
           : '<span class="text-[10px] text-slate-500">无缓存证据</span>';
+        const sid = escHtml(item.session_id);
         return `
-          <button onclick="loadSession('${escHtml(item.session_id)}')" class="session-item ${active} w-full text-left rounded-xl border border-[#1E293B] p-3 hover:border-[#334155] transition-colors">
-            <div class="flex items-center justify-between gap-2 mb-1">
+          <button onclick="loadSession('${sid}')" class="session-item ${active} relative w-full text-left rounded-xl border border-[#1E293B] p-3 hover:border-[#334155] transition-colors">
+            <span onclick="event.stopPropagation();deleteSession('${sid}')" title="删除会话" style="position:absolute;top:6px;right:8px;cursor:pointer;color:#f87171;font-size:14px;line-height:1;padding:2px 4px;" onmouseover="this.style.color='#ef4444'" onmouseout="this.style.color='#f87171'">×</span>
+            <div class="flex items-center justify-between gap-2 mb-1 pr-5">
               <span class="font-mono text-xs text-slate-300">${escHtml(item.session_id.slice(0, 12))}...</span>
               <span class="text-[11px] text-slate-500">${item.turn_count || 0} 轮</span>
             </div>
@@ -384,6 +389,20 @@
       }
     }
 
+    function formatAnswer(text) {
+      if (!text) return '';
+      let html = escHtml(text);
+      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+      html = html.replace(/`([^`]+)`/g, '<code class="bg-[#1E293B] px-1 rounded text-xs">$1</code>');
+      html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" class="text-cta underline">$1</a>');
+      const parts = html.split(/\n{2,}/);
+      return parts.map((part) => {
+        if (!part.trim()) return '';
+        return `<p class="mb-2 whitespace-pre-wrap">${part.replace(/\n/g, '<br>')}</p>`;
+      }).join('');
+    }
+
     function appendTyping() {
       const wrap = document.getElementById('chat-messages');
       const d = document.createElement('div');
@@ -406,7 +425,7 @@
     function handleChatKey(event) {
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
-        sendChat();
+        handleSendClick();
       }
     }
 
@@ -597,6 +616,209 @@
       }
     }
 
+    function handleSendClick() {
+      if (isStreaming) {
+        stopChatStream();
+      } else {
+        sendChatStream();
+      }
+    }
+
+    function stopChatStream() {
+      if (streamAbortController) {
+        streamAbortController.abort();
+        streamAbortController = null;
+      }
+    }
+
+    async function sendChatStream() {
+      const input = document.getElementById('chat-input');
+      const question = input.value.trim();
+      if (!question) return;
+
+      const topK = parseInt(document.getElementById('chat-topk').value, 10);
+      const companies = document.getElementById('chat-companies').value.split(',').map((s) => s.trim()).filter(Boolean);
+      const useRetrieval = document.getElementById('retrieval-toggle').checked;
+
+      input.value = '';
+      appendUserMsg(question);
+
+      const wrap = document.getElementById('chat-messages');
+      const botDiv = document.createElement('div');
+      botDiv.id = 'stream-bot-msg';
+      botDiv.className = 'flex gap-3';
+      botDiv.innerHTML = `${botAvatar()}<div class="msg-bot px-4 py-3 text-sm text-slate-200 max-w-3xl"><div id="stream-answer-text"></div><div id="stream-answer-meta"></div></div>`;
+      wrap.appendChild(botDiv);
+      wrap.scrollTop = wrap.scrollHeight;
+
+      const btn = document.getElementById('send-btn');
+      isStreaming = true;
+      btn.textContent = '停止';
+      input.disabled = true;
+
+      streamAbortController = new AbortController();
+      let currentAnswer = '';
+      let currentEvidence = [];
+      let currentEvidenceSource = null;
+      let currentDegraded = false;
+      let currentDegradeReason = 'none';
+      let currentSessionId = sessionId;
+      let currentPages = [];
+
+      try {
+        const body = {
+          question,
+          top_k: topK,
+          session_id: sessionId,
+          use_retrieval: useRetrieval,
+          refresh_retrieval: false,
+        };
+        if (companies.length) {
+          body.target_companies = companies;
+        }
+
+        const response = await fetch(`${API}/reports/query/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: streamAbortController.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(await response.text());
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          while (true) {
+            const eventEnd = buffer.indexOf('\n\n');
+            if (eventEnd === -1) break;
+            const eventText = buffer.slice(0, eventEnd);
+            buffer = buffer.slice(eventEnd + 2);
+
+            let eventName = '';
+            let dataStr = '';
+            const lines = eventText.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('event: ')) {
+                eventName = line.slice(7);
+              } else if (line.startsWith('data: ')) {
+                dataStr += line.slice(6);
+              }
+            }
+
+            if (eventName === 'meta') {
+              try {
+                const meta = JSON.parse(dataStr);
+                if (meta.session_id) {
+                  currentSessionId = meta.session_id;
+                  setActiveSession(meta.session_id, true);
+                }
+              } catch {}
+              const answerEl = document.getElementById('stream-answer-text');
+              if (answerEl) answerEl.innerHTML = '';
+            } else if (eventName === 'evidence') {
+              try {
+                const ev = JSON.parse(dataStr);
+                if (ev.evidence) {
+                  currentEvidence = ev.evidence;
+                  currentPages = ev.evidence.map((e) => ({
+                    report_id: e.report_id,
+                    page_num: e.page_num,
+                    image_base64: '',
+                    maxsim_score: e.maxsim_score,
+                  }));
+                }
+              } catch {}
+            } else if (eventName === 'content') {
+              try {
+                const c = JSON.parse(dataStr);
+                if (c.chunk) {
+                  currentAnswer += c.chunk;
+                  const answerEl = document.getElementById('stream-answer-text');
+                  if (answerEl) {
+                    answerEl.innerHTML = formatAnswer(currentAnswer);
+                  }
+                  wrap.scrollTop = wrap.scrollHeight;
+                }
+              } catch {}
+            } else if (eventName === 'second_pass') {
+              currentAnswer = '';
+              const answerEl = document.getElementById('stream-answer-text');
+              if (answerEl) {
+                answerEl.innerHTML = '<div class="text-slate-400 text-xs">正在扩展检索更多页面...</div>';
+              }
+            } else if (eventName === 'done') {
+              try {
+                const doneData = JSON.parse(dataStr);
+                currentDegraded = doneData.degraded;
+                currentDegradeReason = doneData.degrade_reason || 'none';
+                currentEvidenceSource = doneData.evidence_source || null;
+              } catch {}
+              const metaEl = document.getElementById('stream-answer-meta');
+              if (metaEl) {
+                metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
+              }
+              if (currentEvidence && currentEvidence.length) {
+                updateEvidenceStatus(true);
+              }
+            } else if (eventName === 'error') {
+              try {
+                const errData = JSON.parse(dataStr);
+                currentAnswer = `错误：${errData.message || errData.code || '未知错误'}`;
+                const answerEl = document.getElementById('stream-answer-text');
+                if (answerEl) {
+                  answerEl.innerHTML = `<span class="text-red-400">${escHtml(currentAnswer)}</span>`;
+                }
+              } catch {}
+              const metaEl = document.getElementById('stream-answer-meta');
+              if (metaEl) metaEl.innerHTML = '';
+            }
+          }
+        }
+
+        const metaEl = document.getElementById('stream-answer-meta');
+        if (metaEl && !metaEl.innerHTML) {
+          metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
+        }
+
+        if (currentSessionId) {
+          fetch(`${API}/reports/sessions/${currentSessionId}/evidence-status`)
+            .then((r) => r.ok ? r.json() : { has_evidence: false })
+            .then((ev) => updateEvidenceStatus(Boolean(ev.has_evidence)))
+            .catch(() => {});
+        }
+
+        await refreshSessions(false);
+
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          const answerEl = document.getElementById('stream-answer-text');
+          if (answerEl) {
+            answerEl.innerHTML += '<div class="text-slate-500 text-xs mt-2">[已停止]</div>';
+          }
+        } else {
+          const botWrap = document.getElementById('stream-bot-msg');
+          if (botWrap) botWrap.remove();
+          const message = `查询失败：${error.message || '未知错误'}`;
+          appendBotMsg({ answerHtml: `<span class="text-red-400">${escHtml(message)}</span>` });
+        }
+      } finally {
+        isStreaming = false;
+        streamAbortController = null;
+        btn.textContent = '发送';
+        input.disabled = false;
+        input.focus();
+      }
+    }
+
     function handleDrop(event) {
       event.preventDefault();
       document.getElementById('drop-zone').classList.remove('border-cta', 'bg-cta/5');
@@ -619,14 +841,90 @@
       }
     }
 
+    const PDF_CHUNK_SIZE = 20;
+
+    async function uploadSingleFile(fileOrBlob, reportId) {
+      const fd = new FormData();
+      fd.append('file', fileOrBlob, fileOrBlob.name || `${reportId}.pdf`);
+      fd.append('report_id', reportId);
+      const response = await fetch(`${API}/reports/upload`, { method: 'POST', body: fd });
+      if (!response.ok) {
+        let msg;
+        try { msg = (await response.json()).detail || response.statusText; } catch { msg = await response.text(); }
+        throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+      }
+      const data = await response.json();
+      if (!data.task_id) throw new Error('服务器未返回任务 ID');
+      return data.task_id;
+    }
+
+    function waitTask(taskId, bar, status, detail, prog) {
+      return new Promise((resolve, reject) => {
+        const doPoll = async () => {
+          try {
+            const r = await fetch(`${API}/reports/tasks/${taskId}`);
+            if (!r.ok) throw new Error('查询任务状态失败');
+            const d = await r.json();
+            if (d.status === 'pending') { bar.style.width = '45%'; status.textContent = '等待中...'; }
+            else if (d.status === 'running') { bar.style.width = '65%'; status.textContent = '处理中...'; }
+            else if (d.status === 'success') {
+              bar.style.width = '100%'; status.textContent = '完成';
+              detail.textContent = d.detail || '';
+              showToast('success', `${d.report_id || taskId} 处理成功`);
+              setTimeout(() => prog.classList.add('hidden'), 2500);
+              return resolve();
+            } else if (d.status === 'failed') {
+              bar.style.width = '100%';
+              bar.classList.replace('bg-cta', 'bg-red-500');
+              status.textContent = '失败'; detail.textContent = d.detail || '';
+              showToast('error', `处理失败：${d.detail || '未知错误'}`);
+              setTimeout(() => { bar.classList.replace('bg-red-500', 'bg-cta'); prog.classList.add('hidden'); }, 4000);
+              return reject(new Error(d.detail || '处理失败'));
+            }
+            setTimeout(doPoll, TASK_POLL_INTERVAL_MS);
+          } catch (e) { status.textContent = '查询失败'; showToast('error', `轮询任务失败：${e.message}`); reject(e); }
+        };
+        doPoll();
+      });
+    }
+
+    async function splitAndUploadPdf(file, baseReportId) {
+      const prog = document.getElementById('upload-progress');
+      const bar = document.getElementById('progress-bar');
+      const status = document.getElementById('upload-status');
+      const detail = document.getElementById('upload-detail');
+
+      const arrayBuffer = await file.arrayBuffer();
+      const srcDoc = await PDFLib.PDFDocument.load(arrayBuffer);
+      const totalPages = srcDoc.getPageCount();
+      const totalChunks = Math.ceil(totalPages / PDF_CHUNK_SIZE);
+
+      for (let i = 0; i < totalChunks; i++) {
+        const startPage = i * PDF_CHUNK_SIZE;
+        const endPage = Math.min(startPage + PDF_CHUNK_SIZE, totalPages);
+        const chunkId = `${baseReportId}_p${String(startPage + 1).padStart(3, '0')}`;
+
+        status.textContent = `第 ${i + 1}/${totalChunks} 块 (页 ${startPage + 1}-${endPage})`;
+        bar.style.width = `${Math.round((i / totalChunks) * 40) + 10}%`;
+        detail.textContent = '';
+
+        const chunkDoc = await PDFLib.PDFDocument.create();
+        const pages = await chunkDoc.copyPages(srcDoc, Array.from({ length: endPage - startPage }, (_, k) => startPage + k));
+        pages.forEach(p => chunkDoc.addPage(p));
+        const bytes = await chunkDoc.save();
+        const blob = new Blob([bytes], { type: 'application/pdf' });
+        blob.name = `${chunkId}.pdf`;
+
+        const taskId = await uploadSingleFile(blob, chunkId);
+        bar.style.width = `${Math.round(((i + 0.5) / totalChunks) * 60) + 40}%`;
+        await waitTask(taskId, bar, status, detail, prog);
+      }
+    }
+
     async function uploadFile() {
       if (!selectedFile) return showToast('error', '请先选择文件');
       const reportId = document.getElementById('report-id').value.trim();
       if (!reportId) return showToast('error', '请填写 Report ID');
-
-      const fd = new FormData();
-      fd.append('file', selectedFile);
-      fd.append('report_id', reportId);
 
       const prog = document.getElementById('upload-progress');
       const bar = document.getElementById('progress-bar');
@@ -639,19 +937,19 @@
       detail.textContent = '';
 
       try {
-        const response = await fetch(`${API}/reports/upload`, { method: 'POST', body: fd });
-        if (!response.ok) {
-          let msg;
-          try { msg = (await response.json()).detail || response.statusText; } catch { msg = await response.text(); }
-          throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+        const isPdf = selectedFile.type === 'application/pdf' || selectedFile.name.toLowerCase().endsWith('.pdf');
+        if (isPdf) {
+          const ab = await selectedFile.arrayBuffer();
+          const doc = await PDFLib.PDFDocument.load(ab);
+          if (doc.getPageCount() > PDF_CHUNK_SIZE) {
+            await splitAndUploadPdf(selectedFile, reportId);
+            return;
+          }
         }
-        const data = await response.json();
+        const taskId = await uploadSingleFile(selectedFile, reportId);
         bar.style.width = '40%';
         status.textContent = '等待处理...';
-        if (!data.task_id) {
-          throw new Error('服务器未返回任务 ID');
-        }
-        pollTask(data.task_id, bar, status, detail, prog);
+        await waitTask(taskId, bar, status, detail, prog);
       } catch (error) {
         bar.style.width = '0%';
         status.textContent = '失败';
@@ -697,6 +995,18 @@
         }
       };
       doPoll();
+    }
+
+    async function deleteSession(targetSessionId) {
+      try {
+        const r = await fetch(`${API}/reports/sessions/${targetSessionId}`, { method: 'DELETE' });
+        if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+        if (targetSessionId === sessionId) newSession(false);
+        await refreshSessions(false);
+        showToast('success', `会话 ${targetSessionId.slice(0, 12)}… 已删除`);
+      } catch (e) {
+        showToast('error', `删除失败：${e.message}`);
+      }
     }
 
     function showToast(type, message) {

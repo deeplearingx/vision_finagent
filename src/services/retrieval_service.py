@@ -304,18 +304,19 @@ def retrieve(
     for r, p in candidates:
         rid_to_pnums[r].append(p)
 
-    clauses = [
-        f"(report_id == {json.dumps(r)} and page_num in {json.dumps(pnums)})"
-        for r, pnums in rid_to_pnums.items()
-    ]
-    filter_expr = " or ".join(clauses)
-
-    patch_rows = client.query(
-        collection_name=name,
-        filter=filter_expr,
-        output_fields=["report_id", "page_num", "colpali_embeddings"],
-        limit=len(candidates) * 1024 + 1,
-    )
+    # Milvus Lite hard limit is 16384 rows per query call.
+    # Each page has ~1024 patches, so we batch by report to stay under the limit.
+    _MILVUS_QUERY_LIMIT = 16384
+    patch_rows: list = []
+    for r, pnums in rid_to_pnums.items():
+        clause = f"(report_id == {json.dumps(r)} and page_num in {json.dumps(pnums)})"
+        batch_limit = min(len(pnums) * 1024 + 1, _MILVUS_QUERY_LIMIT)
+        patch_rows.extend(client.query(
+            collection_name=name,
+            filter=clause,
+            output_fields=["report_id", "page_num", "colpali_embeddings"],
+            limit=batch_limit,
+        ))
 
     # Group patch vectors by page
     pages: dict[tuple[str, int], list] = {}
