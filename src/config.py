@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     MILVUS_URI: str = DEFAULT_MILVUS_LITE_PATH  # local file mode; set to "http://localhost:19530" for standalone
+    MILVUS_TOKEN: str = ""          # Zilliz Cloud API token; leave empty for local/self-hosted
+    MILVUS_DB_NAME: str = "default" # Zilliz Cloud database name; "default" for most cases
     MILVUS_COLLECTION: str = "fin_vision_reports"
 
     REDIS_URL: str = "redis://localhost:6379/0"

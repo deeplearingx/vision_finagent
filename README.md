@@ -56,6 +56,32 @@ vision_finagent/
 
 项目从 [`.env`](.env) 读取运行配置。常用项如下：
 
+### Milvus 连接模式
+
+**本地 Lite 模式（默认）**：不设置 `MILVUS_URI`，项目自动使用本地文件 `milvus_local.db`。
+
+**Zilliz Cloud 云端模式**：在 `.env` 中设置以下三项：
+
+```env
+MILVUS_URI=https://in03-xxxxxxxxxxxxxxxxx.serverless.gcp-us-west1.cloud.zilliz.com
+MILVUS_TOKEN=your_zilliz_api_token_here
+MILVUS_DB_NAME=default
+```
+
+- `MILVUS_URI`：Zilliz Cloud 控制台 → Cluster → Public Endpoint（保留 `https://`）
+- `MILVUS_TOKEN`：Zilliz Cloud 控制台 → API Keys → 生成或复制 token
+- `MILVUS_DB_NAME`：默认填 `default`；若创建了独立 database 则填对应名称
+- 切换到云端后，原本地 `milvus_local.db` 中的数据**不会自动迁移**，需重新上传 PDF
+
+**自建 Milvus Standalone（无认证）**：
+
+```env
+MILVUS_URI=http://your-host:19530
+# 不设置 MILVUS_TOKEN
+```
+
+---
+
 ```env
 MILVUS_COLLECTION=fin_vision_reports_v2
 REDIS_URL=redis://localhost:6379/0

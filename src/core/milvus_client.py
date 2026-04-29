@@ -9,13 +9,22 @@ _log = logging.getLogger(__name__)
 
 # Expected field sets per collection (field_name -> DataType name)
 _PATCHES_EXPECTED_FIELDS = {"pk", "report_id", "page_num", "colpali_embeddings"}
-_PAGES_EXPECTED_FIELDS = {"page_id", "report_id", "page_num", "image_base64"}
+_PAGES_EXPECTED_FIELDS = {"page_id", "report_id", "page_num", "image_base64", "_vec"}
 
 
 def get_client() -> MilvusClient:
     global _client
     if _client is None:
-        _client = MilvusClient(settings.MILVUS_URI)
+        if settings.MILVUS_TOKEN:
+            # Zilliz Cloud: TLS endpoint + token authentication
+            _client = MilvusClient(
+                uri=settings.MILVUS_URI,
+                token=settings.MILVUS_TOKEN,
+                db_name=settings.MILVUS_DB_NAME,
+            )
+        else:
+            # Local Lite file or self-hosted Milvus (no auth)
+            _client = MilvusClient(settings.MILVUS_URI)
     return _client
 
 
@@ -108,7 +117,11 @@ def check_schema_health() -> list[dict]:
 
 
 def _ensure_pages_collection(client: MilvusClient, name: str) -> None:
-    """page-level metadata: one row per page, stores image_base64."""
+    """page-level metadata: one row per page, stores image_base64.
+
+    A dummy 1-dim float vector field `_vec` is required by Zilliz Cloud
+    (every collection must have a vector field).  It is never searched.
+    """
     if client.has_collection(name):
         _check_schema_drift(client, name, _PAGES_EXPECTED_FIELDS)
         return
@@ -117,7 +130,11 @@ def _ensure_pages_collection(client: MilvusClient, name: str) -> None:
     schema.add_field("report_id", DataType.VARCHAR, max_length=128)
     schema.add_field("page_num", DataType.INT64)
     schema.add_field("image_base64", DataType.JSON)
-    client.create_collection(collection_name=name, schema=schema)
+    schema.add_field("_vec", DataType.FLOAT_VECTOR, dim=2)  # required by Zilliz Cloud (min dim=2)
+
+    index_params = client.prepare_index_params()
+    index_params.add_index(field_name="_vec", index_type="FLAT", metric_type="L2")
+    client.create_collection(collection_name=name, schema=schema, index_params=index_params)
 
 
 def ensure_collection() -> None:

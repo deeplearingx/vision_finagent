@@ -129,6 +129,7 @@ def _insert_pages(report_id: str, images: List[Image.Image], embeddings):
             "report_id": report_id,
             "page_num": page_num,
             "image_base64": b64,
+            "_vec": [0.0, 0.0],  # dummy vector required by Zilliz Cloud (min dim=2)
         }])
         inserted_page_ids.append(page_id)  # track only after success
 
