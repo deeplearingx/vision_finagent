@@ -235,6 +235,87 @@ class TestQuery(BaseCase):
         self.assertFalse(body["degraded"])
         self.assertEqual(len(body["evidence"]), 1)
 
+    # --- fallback tests ---
+
+    def _seed_cache(self, sid, evidence=None):
+        if evidence is None:
+            evidence = [{"report_id": "rpt1", "page_num": 1, "maxsim_score": 0.9}]
+        payload = json.dumps({"cached_at": "2026-01-01T00:00:00+00:00", "evidence": evidence})
+        asyncio.get_event_loop().run_until_complete(
+            self.redis.set(f"session:{sid}:evidence", payload)
+        )
+
+    def test_timeout_with_cache_fallback(self):
+        """Timeout + cache → cached_fallback, not degraded, answer has notice."""
+        from src.models.enums import DegradeReason
+        sid = "s_timeout_cache"
+        self._seed_cache(sid)
+        with patch("src.routers.reports.retrieve", side_effect=asyncio.TimeoutError()), \
+             patch("src.routers.reports.generate_answer",
+                   new_callable=AsyncMock, return_value=("VLM答案", DegradeReason.NONE)):
+            r = self._query(session_id=sid)
+        body = r.json()
+        self.assertEqual(body["evidence_source"], "cached_fallback")
+        self.assertFalse(body["degraded"])
+        self.assertIn("本次检索失败", body["answer"])
+        self.assertIn("自动复用上次证据", body["answer"])
+
+    def test_error_with_cache_fallback(self):
+        """Retrieval error + cache → cached_fallback, not degraded."""
+        from src.models.enums import DegradeReason
+        sid = "s_error_cache"
+        self._seed_cache(sid)
+        with patch("src.routers.reports.retrieve", side_effect=RuntimeError("conn refused")), \
+             patch("src.routers.reports.generate_answer",
+                   new_callable=AsyncMock, return_value=("VLM答案", DegradeReason.NONE)):
+            r = self._query(session_id=sid)
+        body = r.json()
+        self.assertEqual(body["evidence_source"], "cached_fallback")
+        self.assertFalse(body["degraded"])
+
+    def test_timeout_no_cache_degraded(self):
+        """Timeout + no cache → degraded=True, degrade_reason=retrieval_timeout."""
+        with patch("src.routers.reports.retrieve", side_effect=asyncio.TimeoutError()):
+            r = self._query(session_id="s_timeout_nocache")
+        body = r.json()
+        self.assertTrue(body["degraded"])
+        self.assertEqual(body["degrade_reason"], "retrieval_timeout")
+
+    def test_cache_fallback_image_fetch_incomplete(self):
+        """Fallback + Milvus image fetch failure → image_fetch_incomplete=True."""
+        from src.models.enums import DegradeReason
+        sid = "s_img_fail"
+        self._seed_cache(sid)
+        self.mock_milvus.query.side_effect = RuntimeError("milvus down")
+        with patch("src.routers.reports.retrieve", side_effect=asyncio.TimeoutError()), \
+             patch("src.routers.reports.generate_answer",
+                   new_callable=AsyncMock, return_value=("答案", DegradeReason.NONE)):
+            r = self._query(session_id=sid)
+        body = r.json()
+        self.assertEqual(body["evidence_source"], "cached_fallback")
+        self.assertTrue(body["image_fetch_incomplete"])
+        self.mock_milvus.query.side_effect = None  # reset
+
+    def test_cache_fallback_image_missing(self):
+        """Fallback + some images missing in Milvus → image_fetch_incomplete=True."""
+        from src.models.enums import DegradeReason
+        sid = "s_img_missing"
+        self._seed_cache(sid, evidence=[
+            {"report_id": "rpt1", "page_num": 1, "maxsim_score": 0.9},
+            {"report_id": "rpt1", "page_num": 2, "maxsim_score": 0.8},
+        ])
+        self.mock_milvus.query.return_value = [
+            {"report_id": "rpt1", "page_num": 1, "image_base64": "img1"},
+        ]
+        with patch("src.routers.reports.retrieve", side_effect=asyncio.TimeoutError()), \
+             patch("src.routers.reports.generate_answer",
+                   new_callable=AsyncMock, return_value=("答案", DegradeReason.NONE)):
+            r = self._query(session_id=sid)
+        body = r.json()
+        self.assertEqual(body["evidence_source"], "cached_fallback")
+        self.assertTrue(body["image_fetch_incomplete"])
+        self.mock_milvus.query.return_value = []  # reset
+
 
 # ---------------------------------------------------------------------------
 # Sessions tests

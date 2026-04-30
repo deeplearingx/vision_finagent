@@ -60,6 +60,7 @@
       <div class="flex bg-[#020617] rounded-lg p-0.5 gap-0.5">
         <button onclick="switchTab('chat')" id="tab-chat" class="px-3 py-1 rounded-md text-xs font-medium bg-surface text-white">对话</button>
         <button onclick="switchTab('upload')" id="tab-upload" class="px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-white">上传</button>
+        <button onclick="switchTab('admin')" id="tab-admin" class="px-3 py-1 rounded-md text-xs font-medium text-slate-400 hover:text-white">管理</button>
       </div>
       <button onclick="newSession()" title="新会话" class="px-3 py-1.5 rounded-lg text-xs bg-cta text-black font-semibold hover:bg-green-400 transition-colors">新会话</button>
       <div class="flex items-center gap-1.5">
@@ -184,6 +185,40 @@
     </div>
   </div>
 
+  <div id="panel-admin" class="hidden pt-20 pb-12 px-4 max-w-4xl mx-auto w-full">
+    <div class="card rounded-2xl p-6">
+      <div class="flex items-center justify-between mb-5">
+        <h2 class="font-semibold flex items-center gap-2">
+          <svg class="w-5 h-5 text-cta" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/>
+          </svg>
+          Milvus 报告管理
+        </h2>
+        <button onclick="loadInventory()" class="px-3 py-1.5 rounded-lg text-xs bg-[#1E293B] border border-[#334155] text-slate-300 hover:text-white transition-colors">刷新</button>
+      </div>
+      <div class="flex gap-2 mb-4">
+        <input id="prefix-input" type="text" placeholder="前缀（如 boa_2024）" class="flex-1 bg-[#1E293B] border border-[#334155] rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:border-red-500 placeholder-slate-600">
+        <button onclick="deleteByPrefix()" class="px-3 py-1.5 rounded-lg text-xs bg-red-900/40 text-red-400 hover:bg-red-800/60 border border-red-900/50 transition-colors">批量删除前缀</button>
+      </div>
+      <div id="admin-stats" class="text-xs text-slate-500 mb-3"></div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm text-left">
+          <thead class="text-xs text-slate-500 uppercase border-b border-[#1E293B]">
+            <tr>
+              <th class="px-4 py-2">报告前缀</th>
+              <th class="px-4 py-2 text-center">子块数</th>
+              <th class="px-4 py-2 text-center">总页数</th>
+              <th class="px-4 py-2 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody id="admin-table-body">
+            <tr><td colspan="3" class="px-4 py-8 text-center text-slate-500 text-xs">点击刷新加载数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="fixed bottom-5 right-5 hidden z-50">
     <div id="toast-inner" class="card rounded-xl px-4 py-3 text-sm flex items-center gap-3 shadow-xl">
       <span id="toast-icon"></span><span id="toast-msg"></span>
@@ -230,10 +265,105 @@
     }
 
     function switchTab(tab) {
-      document.getElementById('panel-chat').classList.toggle('hidden', tab !== 'chat');
-      document.getElementById('panel-upload').classList.toggle('hidden', tab !== 'upload');
-      document.getElementById('tab-chat').className = `px-3 py-1 rounded-md text-xs font-medium ${tab === 'chat' ? 'bg-surface text-white' : 'text-slate-400 hover:text-white'}`;
-      document.getElementById('tab-upload').className = `px-3 py-1 rounded-md text-xs font-medium ${tab === 'upload' ? 'bg-surface text-white' : 'text-slate-400 hover:text-white'}`;
+      ['chat', 'upload', 'admin'].forEach(t => {
+        document.getElementById(`panel-${t}`).classList.toggle('hidden', t !== tab);
+        document.getElementById(`tab-${t}`).className = `px-3 py-1 rounded-md text-xs font-medium ${t === tab ? 'bg-surface text-white' : 'text-slate-400 hover:text-white'}`;
+      });
+      if (tab === 'admin') loadInventory();
+    }
+
+    function _groupByPrefix(reports) {
+      const groups = {};
+      reports.forEach(r => {
+        const m = r.report_id.match(/^(.+?)(_p\d{3,})?$/);
+        const prefix = (m && m[2]) ? m[1] : r.report_id;
+        if (!groups[prefix]) groups[prefix] = [];
+        groups[prefix].push(r);
+      });
+      return groups;
+    }
+
+    async function loadInventory() {
+      const tbody = document.getElementById('admin-table-body');
+      tbody.innerHTML = '<tr><td colspan="4" class="px-4 py-8 text-center text-slate-500 text-xs">加载中...</td></tr>';
+      try {
+        const data = await fetch(`${API}/reports/admin/inventory`).then(r => r.json());
+        document.getElementById('admin-stats').textContent =
+          `共 ${data.total_reports} 个 chunk，${data.total_rows_fetched} 页${data.truncated ? '（已截断）' : ''}`;
+        if (!data.reports.length) {
+          tbody.innerHTML = '<tr><td colspan="4" class="px-4 py-8 text-center text-slate-500 text-xs">暂无数据</td></tr>';
+          return;
+        }
+        const groups = _groupByPrefix(data.reports);
+        tbody.innerHTML = Object.entries(groups).map(([prefix, items]) => {
+          const totalPages = items.reduce((s, it) => s + it.page_count, 0);
+          const subRows = items.map(r => `
+            <tr class="admin-sub hidden bg-[#080f1a]" data-group="${escHtml(prefix)}">
+              <td class="px-4 py-2 pl-10 font-mono text-[11px] text-slate-400">${escHtml(r.report_id)}</td>
+              <td class="px-4 py-2 text-center text-[11px] text-slate-500">—</td>
+              <td class="px-4 py-2 text-center text-[11px] text-slate-500">${r.page_count}</td>
+              <td class="px-4 py-2 text-right">
+                <button onclick="deleteReport('${escHtml(r.report_id)}')"
+                  class="px-2 py-0.5 rounded text-[10px] bg-red-900/30 text-red-400 hover:bg-red-800/50 border border-red-900/40">删除</button>
+              </td>
+            </tr>`).join('');
+          return `
+            <tr class="cursor-pointer hover:bg-[#0f172a] transition-colors border-b border-[#1E293B]" onclick="toggleGroup('${escHtml(prefix)}')">
+              <td class="px-4 py-3 text-xs text-slate-200">
+                <span class="mr-1 text-slate-500 text-[10px]" id="arrow-${escHtml(prefix)}">▶</span>${escHtml(prefix)}
+              </td>
+              <td class="px-4 py-3 text-center text-xs text-slate-400">${items.length}</td>
+              <td class="px-4 py-3 text-center text-xs text-slate-400">${totalPages}</td>
+              <td class="px-4 py-3 text-right">
+                <button onclick="event.stopPropagation();deleteByPrefixRaw('${escHtml(prefix)}')"
+                  class="px-3 py-1 rounded text-xs bg-red-900/40 text-red-400 hover:bg-red-800/60 border border-red-900/50">批量删除</button>
+              </td>
+            </tr>${subRows}`;
+        }).join('');
+      } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="4" class="px-4 py-8 text-center text-red-400 text-xs">加载失败：${escHtml(String(e))}</td></tr>`;
+      }
+    }
+
+    function toggleGroup(prefix) {
+      document.querySelectorAll(`tr.admin-sub[data-group="${prefix}"]`).forEach(tr => tr.classList.toggle('hidden'));
+      const arrow = document.getElementById(`arrow-${prefix}`);
+      if (arrow) arrow.textContent = arrow.textContent === '▶' ? '▼' : '▶';
+    }
+
+    async function deleteReport(reportId) {
+      if (!confirm(`确认删除 "${reportId}" 的所有数据？此操作不可撤销。`)) return;
+      try {
+        const res = await fetch(`${API}/reports/admin/report/${encodeURIComponent(reportId)}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.deleted) {
+          showToast('success', `已删除 ${reportId}`);
+          loadInventory();
+        } else {
+          showToast('error', '删除失败');
+        }
+      } catch (e) {
+        showToast('error', `删除出错：${e}`);
+      }
+    }
+
+    async function deleteByPrefix() {
+      const prefix = document.getElementById('prefix-input').value.trim();
+      if (!prefix) { showToast('error', '请输入前缀'); return; }
+      await deleteByPrefixRaw(prefix);
+      document.getElementById('prefix-input').value = '';
+    }
+
+    async function deleteByPrefixRaw(prefix) {
+      if (!confirm(`确认删除所有以 "${prefix}" 开头的报告？此操作不可撤销。`)) return;
+      try {
+        const res = await fetch(`${API}/reports/admin/report-prefix/${encodeURIComponent(prefix)}`, { method: 'DELETE' });
+        const data = await res.json();
+        showToast('success', `已删除 ${data.deleted_reports} 个报告`);
+        loadInventory();
+      } catch (e) {
+        showToast('error', `批量删除出错：${e}`);
+      }
     }
 
     async function checkHealth() {
@@ -702,6 +832,7 @@
           const { done, value } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
+          buffer = buffer.replace(/\r\n/g, '\n');
 
           while (true) {
             const eventEnd = buffer.indexOf('\n\n');
@@ -728,7 +859,13 @@
                   setActiveSession(meta.session_id, true);
                 }
               } catch {}
-              answerEl.innerHTML = '';
+              answerEl.innerHTML = '<div class="text-slate-400 text-xs animate-pulse">正在检索相关页面...</div>';
+            } else if (eventName === 'status') {
+              try {
+                const s = JSON.parse(dataStr);
+                answerEl.innerHTML = `<div class="text-slate-400 text-xs animate-pulse">${escHtml(s.message || '')}</div>`;
+                wrap.scrollTop = wrap.scrollHeight;
+              } catch {}
             } else if (eventName === 'evidence') {
               try {
                 const ev = JSON.parse(dataStr);
@@ -841,6 +978,9 @@
       if (!response.ok) {
         let msg;
         try { msg = (await response.json()).detail || response.statusText; } catch { msg = await response.text(); }
+        if (response.status === 409) {
+          msg = `Report ID "${reportId}" 已存在（重复上传）。请先在「管理」页删除该报告，再重新上传。`;
+        }
         throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
       }
       const data = await response.json();

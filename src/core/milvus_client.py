@@ -156,6 +156,26 @@ def delete_report_data(report_id: str) -> None:
     )
 
 
+def delete_report_data_by_prefix(prefix: str) -> dict:
+    """Delete all patches and pages whose report_id starts with prefix."""
+    client = get_client()
+    # Query matching report_ids first
+    col_pages = get_pages_collection_name()
+    rows = client.query(
+        collection_name=col_pages,
+        filter="",
+        output_fields=["report_id"],
+        limit=16000,
+    )
+    matched = {r["report_id"] for r in rows if r.get("report_id", "").startswith(prefix)}
+    if not matched:
+        return {"prefix": prefix, "deleted_reports": 0, "matched_ids": []}
+    for rid in matched:
+        client.delete(collection_name=get_collection_name(), filter=f'report_id == "{rid}"')
+        client.delete(collection_name=col_pages, filter=f'report_id == "{rid}"')
+    return {"prefix": prefix, "deleted_reports": len(matched), "matched_ids": sorted(matched)}
+
+
 # Maximum rows fetched when enumerating report inventory.
 # Zilliz Cloud hard-caps query limit at 16384; use a safe value.
 _INVENTORY_PAGE_SIZE = 16_000

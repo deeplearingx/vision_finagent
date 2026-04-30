@@ -119,3 +119,39 @@ class TestInventoryEndpoints:
         data = resp.json()
         assert data["found"] is False
         assert data["page_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# DELETE endpoint: idempotency token release tests
+# ---------------------------------------------------------------------------
+
+class TestDeleteReleasesToken:
+    def test_delete_single_releases_idem_token(self, client: TestClient, patch_milvus, fake_redis):
+        """DELETE /admin/report/{id} must release the upload idempotency token."""
+        import asyncio
+        # Pre-set the token as if a previous upload succeeded
+        asyncio.get_event_loop().run_until_complete(
+            fake_redis.set("upload:rpt_del", "1", nx=True, ex=86400)
+        )
+        resp = client.delete("/reports/admin/report/rpt_del")
+        assert resp.status_code == 200
+        # Token must be gone so a re-upload is allowed
+        val = asyncio.get_event_loop().run_until_complete(fake_redis.get("upload:rpt_del"))
+        assert val is None
+
+    def test_delete_prefix_releases_all_tokens(self, client: TestClient, patch_milvus, fake_redis):
+        """DELETE /admin/report-prefix/{prefix} must release tokens for all matched report_ids."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        for rid in ("boa_2024_p001", "boa_2024_p005"):
+            loop.run_until_complete(fake_redis.set(f"upload:{rid}", "1", nx=True, ex=86400))
+
+        patch_milvus.query.return_value = [
+            {"report_id": "boa_2024_p001"},
+            {"report_id": "boa_2024_p005"},
+        ]
+        resp = client.delete("/reports/admin/report-prefix/boa_2024")
+        assert resp.status_code == 200
+        for rid in ("boa_2024_p001", "boa_2024_p005"):
+            val = loop.run_until_complete(fake_redis.get(f"upload:{rid}"))
+            assert val is None, f"Token for {rid} was not released"

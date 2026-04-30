@@ -3,8 +3,9 @@ import io
 from PIL import Image
 
 MAX_SIZE = (2048, 2048)
-# Milvus/Zilliz JSON field hard limit (bytes of the base64 string)
-_DB_B64_LIMIT = 65536
+# Milvus/Zilliz JSON field hard limit (bytes of the base64 string).
+# Use 64000 (< 65536) to leave headroom for Milvus internal encoding overhead.
+_DB_B64_LIMIT = 64000
 
 
 def to_base64(img: Image.Image) -> str:

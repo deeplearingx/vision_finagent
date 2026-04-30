@@ -16,7 +16,7 @@ from pydantic import BaseModel
 log = structlog.get_logger()
 from ..models.schema import PageResult, EvidenceSummary
 from ..models.enums import ReportStatus, DegradeReason
-from ..utils.idempotency import check_and_set
+from ..utils.idempotency import check_and_set, release as _release_idem
 from ..services.retrieval_service import retrieve
 from ..services.vlm_service import (
     generate_answer, is_insufficient_evidence,
@@ -25,7 +25,7 @@ from ..services.vlm_service import (
 )
 from ..services.task_service import submit_ingest_task, get_task
 from ..core.redis_client import get_redis
-from ..core.milvus_client import clear_report_collections, list_reports_inventory
+from ..core.milvus_client import clear_report_collections, list_reports_inventory, delete_report_data, delete_report_data_by_prefix
 
 # Redis key: session:{session_id}  TTL: 2 days
 _SESSION_TTL = 2 * 86400
@@ -213,6 +213,71 @@ async def _clear_evidence_cache(session_id: str) -> None:
     await r.delete(f"session:{session_id}:evidence")
 
 
+async def _build_pages_from_cache(
+    session_id: str,
+) -> tuple[list["PageResult"], bool, bool]:
+    """Load cached evidence and fetch images from Milvus.
+
+    Returns:
+        (pages, found_cache, image_fetch_incomplete)
+        - found_cache=False means no cache exists at all.
+    """
+    from ..core.milvus_client import get_client as _get_mc, get_pages_collection_name as _pages_col
+    cached = await _load_evidence_cache(session_id)
+    cached_evidence = cached.get("evidence", []) if cached else []
+    if not cached_evidence:
+        return [], False, False
+
+    page_ids = [f"{e['report_id']}_{e['page_num']}" for e in cached_evidence]
+    img_map: dict = {}
+    image_fetch_incomplete = False
+    try:
+        meta_rows = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_mc().query(
+                collection_name=_pages_col(),
+                filter=f"page_id in {json.dumps(page_ids)}",
+                output_fields=["report_id", "page_num", "image_base64"],
+                limit=len(page_ids) + 1,
+            ),
+        )
+        img_map = {(r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows}
+        missing = [pid for pid in page_ids if not img_map.get(tuple(pid.rsplit("_", 1)))]
+        # rebuild missing check properly
+        missing = [
+            f"{e['report_id']}_{e['page_num']}"
+            for e in cached_evidence
+            if not img_map.get((e["report_id"], e["page_num"]))
+        ]
+        if missing:
+            image_fetch_incomplete = True
+            log.warning(
+                "cache_reuse_image_missing",
+                session_id=session_id,
+                missing_page_ids=missing,
+                detail="Some pages have no image_base64 in Milvus; VLM quality may degrade",
+            )
+    except Exception:
+        image_fetch_incomplete = True
+        log.warning(
+            "cache_reuse_image_fetch_failed",
+            session_id=session_id,
+            page_ids=page_ids,
+            detail="Milvus image query failed; image_base64 will be empty, VLM quality may degrade",
+        )
+
+    pages = [
+        PageResult(
+            report_id=e["report_id"],
+            page_num=e["page_num"],
+            image_base64=img_map.get((e["report_id"], e["page_num"]), ""),
+            maxsim_score=e["maxsim_score"],
+        )
+        for e in cached_evidence
+    ]
+    return pages, True, image_fetch_incomplete
+
+
 async def _backfill_meta(session_id: str, score: float) -> dict:
     """Minimal meta backfill for legacy sessions that have history but no meta key."""
     hist = await _load_history(session_id)
@@ -330,6 +395,29 @@ async def check_report_in_inventory(report_id: str):
     }
 
 
+@router.delete("/admin/report/{report_id}", status_code=200)
+async def delete_report(report_id: str):
+    """删除指定 report_id 的所有 patches 和 pages 数据，并释放幂等 token。"""
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, delete_report_data, report_id)
+        await _release_idem(f"upload:{report_id}")
+        return {"report_id": report_id, "deleted": True}
+    except Exception as exc:
+        raise HTTPException(500, f"删除失败：{exc}")
+
+
+@router.delete("/admin/report-prefix/{prefix}", status_code=200)
+async def delete_reports_by_prefix(prefix: str):
+    """删除所有 report_id 以 prefix 开头的报告数据，并释放对应幂等 token。"""
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, delete_report_data_by_prefix, prefix)
+        for rid in result.get("matched_ids", []):
+            await _release_idem(f"upload:{rid}")
+        return result
+    except Exception as exc:
+        raise HTTPException(500, f"批量删除失败：{exc}")
+
+
 @router.post("/admin/clear-collections", status_code=200)
 async def clear_collections():
     global _maintenance_active
@@ -419,80 +507,57 @@ async def query_report(req: QueryRequest):
             )
             log.info("retrieval.submit_done", session_id=session_id, pages=len(pages))
         except asyncio.TimeoutError:
-            log.error("query_timeout", session_id=session_id, question=req.question)
-            degraded = True
+            log.error("retrieval.timeout", session_id=session_id, question=req.question,
+                      evidence_source="live")
             degrade_reason = DegradeReason.RETRIEVAL_TIMEOUT
             pages = []
         except Exception:
-            log.exception("query_failed", session_id=session_id, question=req.question)
-            degraded = True
+            log.exception("retrieval.error", session_id=session_id, question=req.question,
+                          evidence_source="live")
             degrade_reason = DegradeReason.RETRIEVAL_ERROR
             pages = []
 
         if pages:
             await _save_evidence_cache(session_id, pages)
-        elif not degraded:
-            # Only clear cache when retrieval succeeded but returned no results
-            # (not on timeout/error), to avoid destroying valid cached evidence.
-            await _clear_evidence_cache(session_id)
-    else:
-        cached = await _load_evidence_cache(session_id)
-        cached_evidence = cached.get("evidence", []) if cached else []
-        if cached_evidence:
-            evidence_source = "cached"
-            # Reconstruct PageResult from lightweight meta + fetch images from Milvus
-            from ..core.milvus_client import get_client as _get_mc, get_pages_collection_name as _pages_col
-            page_ids = [f"{e['report_id']}_{e['page_num']}" for e in cached_evidence]
-            img_map: dict = {}
-            _milvus_ok = True
-            try:
-                meta_rows = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: _get_mc().query(
-                        collection_name=_pages_col(),
-                        filter=f"page_id in {json.dumps(page_ids)}",
-                        output_fields=["report_id", "page_num", "image_base64"],
-                        limit=len(page_ids) + 1,
-                    ),
-                )
-                img_map = {(r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows}
-            except Exception:
-                _milvus_ok = False
-                image_fetch_incomplete = True
+            log.info("retrieval.evidence_source", source="live", session_id=session_id, pages=len(pages))
+        elif degrade_reason != DegradeReason.NONE:
+            # Retrieval failed — try fallback to cached evidence
+            fallback_pages, found_cache, fetch_incomplete = await _build_pages_from_cache(session_id)
+            if found_cache:
+                pages = fallback_pages
+                image_fetch_incomplete = fetch_incomplete
+                evidence_source = "cached_fallback"
                 log.warning(
-                    "cache_reuse_image_fetch_failed",
+                    "retrieval.cached_fallback",
                     session_id=session_id,
-                    page_ids=page_ids,
-                    detail="Milvus image query failed; image_base64 will be empty, VLM quality may degrade",
+                    degrade_reason=degrade_reason.value,
+                    cached_pages=len(pages),
                 )
-            if _milvus_ok:
-                _missing = [
-                    f"{e['report_id']}_{e['page_num']}"
-                    for e in cached_evidence
-                    if not img_map.get((e["report_id"], e["page_num"]))
-                ]
-                if _missing:
-                    image_fetch_incomplete = True
-                    log.warning(
-                        "cache_reuse_image_missing",
-                        session_id=session_id,
-                        missing_page_ids=_missing,
-                        detail="Some pages have no image_base64 in Milvus; VLM quality may degrade",
-                    )
-            pages = [
-                PageResult(
-                    report_id=e["report_id"],
-                    page_num=e["page_num"],
-                    image_base64=img_map.get((e["report_id"], e["page_num"]), ""),
-                    maxsim_score=e["maxsim_score"],
+            else:
+                degraded = True
+                log.warning(
+                    "retrieval.no_cache_fallback",
+                    session_id=session_id,
+                    degrade_reason=degrade_reason.value,
+                    evidence_source="none",
                 )
-                for e in cached_evidence
-            ]
+        else:
+            # Retrieval succeeded but returned no results — clear stale cache
+            await _clear_evidence_cache(session_id)
+            log.info("retrieval.evidence_source", source="live_empty", session_id=session_id)
+    else:
+        cached_pages, found_cache, fetch_incomplete = await _build_pages_from_cache(session_id)
+        if found_cache:
+            pages = cached_pages
+            image_fetch_incomplete = fetch_incomplete
+            evidence_source = "cached"
+            log.info("retrieval.evidence_source", source="cached", session_id=session_id, pages=len(pages))
         else:
             degraded = True
             degrade_reason = DegradeReason.NO_EVIDENCE
             evidence_source = "none"
             answer = "当前会话尚无可复用的检索证据，请开启「检索数据」后再提问，或先进行一次检索。"
+            log.warning("retrieval.evidence_source", source="none", session_id=session_id)
 
     if not degraded and pages:
         t0 = time.monotonic()
@@ -576,6 +641,10 @@ async def query_report(req: QueryRequest):
             degraded = True
             degrade_reason = vlm_reason
             answer = f"VLM 生成失败（{vlm_reason.value}），已找到 {len(pages)} 个相关页面，最高相关度 {pages[0].maxsim_score:.2f}（{pages[0].report_id} 第 {pages[0].page_num} 页）。"
+
+        # cached_fallback: prepend notice so user knows retrieval failed
+        if evidence_source == "cached_fallback" and answer:
+            answer = "（本次检索失败，已自动复用上次证据继续回答）\n\n" + answer
 
         # Soft market-boundary hint: append only when evidence is still insufficient
         # after all passes AND the question looks market/price-trend oriented.
@@ -665,6 +734,7 @@ async def query_report_stream(req: QueryRequest):
 
             # --- retrieval logic (mirrors /query exactly) ---
             if run_retrieval:
+                yield f"event: status\ndata: {json.dumps({'message': '正在检索相关页面...'})}\n\n"
                 try:
                     pages = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
@@ -674,81 +744,63 @@ async def query_report_stream(req: QueryRequest):
                         timeout=settings.QUERY_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    log.error("query_timeout", session_id=session_id, question=req.question)
-                    degraded = True
+                    log.error("retrieval.timeout", session_id=session_id, question=req.question,
+                              evidence_source="live")
                     degrade_reason = DegradeReason.RETRIEVAL_TIMEOUT
-                    evidence_source = "none"
                     pages = []
-                    yield f"event: content\ndata: {json.dumps({'chunk': '检索超时，无法获取相关证据，请稍后重试。'})}\n\n"
                 except Exception:
-                    log.exception("query_failed", session_id=session_id, question=req.question)
-                    degraded = True
+                    log.exception("retrieval.error", session_id=session_id, question=req.question,
+                                  evidence_source="live")
                     degrade_reason = DegradeReason.RETRIEVAL_ERROR
-                    evidence_source = "none"
                     pages = []
-                    yield f"event: content\ndata: {json.dumps({'chunk': '检索异常，无法获取相关证据，请稍后重试。'})}\n\n"
 
                 if pages:
                     await _save_evidence_cache(session_id, pages)
-                elif not degraded:
-                    await _clear_evidence_cache(session_id)
-            else:
-                cached = await _load_evidence_cache(session_id)
-                cached_evidence = cached.get("evidence", []) if cached else []
-                if cached_evidence:
-                    evidence_source = "cached"
-                    from ..core.milvus_client import get_client as _get_mc, get_pages_collection_name as _pages_col
-                    page_ids = [f"{e['report_id']}_{e['page_num']}" for e in cached_evidence]
-                    img_map: dict = {}
-                    _milvus_ok = True
-                    try:
-                        meta_rows = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: _get_mc().query(
-                                collection_name=_pages_col(),
-                                filter=f"page_id in {json.dumps(page_ids)}",
-                                output_fields=["report_id", "page_num", "image_base64"],
-                                limit=len(page_ids) + 1,
-                            ),
-                        )
-                        img_map = {(r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows}
-                    except Exception:
-                        _milvus_ok = False
-                        image_fetch_incomplete = True
+                    log.info("retrieval.evidence_source", source="live", session_id=session_id, pages=len(pages))
+                    yield f"event: status\ndata: {json.dumps({'message': f'已找到 {len(pages)} 个相关页面，正在生成回答...'})}\n\n"
+                elif degrade_reason != DegradeReason.NONE:
+                    # Retrieval failed — try fallback to cached evidence
+                    fallback_pages, found_cache, fetch_incomplete = await _build_pages_from_cache(session_id)
+                    if found_cache:
+                        pages = fallback_pages
+                        image_fetch_incomplete = fetch_incomplete
+                        evidence_source = "cached_fallback"
                         log.warning(
-                            "cache_reuse_image_fetch_failed",
+                            "retrieval.cached_fallback",
                             session_id=session_id,
-                            page_ids=page_ids,
-                            detail="Milvus image query failed; image_base64 will be empty, VLM quality may degrade",
+                            degrade_reason=degrade_reason.value,
+                            cached_pages=len(pages),
                         )
-                    if _milvus_ok:
-                        _missing = [
-                            f"{e['report_id']}_{e['page_num']}"
-                            for e in cached_evidence
-                            if not img_map.get((e["report_id"], e["page_num"]))
-                        ]
-                        if _missing:
-                            image_fetch_incomplete = True
-                            log.warning(
-                                "cache_reuse_image_missing",
-                                session_id=session_id,
-                                missing_page_ids=_missing,
-                                detail="Some pages have no image_base64 in Milvus; VLM quality may degrade",
-                            )
-                    pages = [
-                        PageResult(
-                            report_id=e["report_id"],
-                            page_num=e["page_num"],
-                            image_base64=img_map.get((e["report_id"], e["page_num"]), ""),
-                            maxsim_score=e["maxsim_score"],
+                        yield f"event: status\ndata: {json.dumps({'message': f'本次检索失败，已自动复用上次证据继续回答（{len(pages)} 个页面）...'})}\n\n"
+                    else:
+                        degraded = True
+                        evidence_source = "none"
+                        log.warning(
+                            "retrieval.no_cache_fallback",
+                            session_id=session_id,
+                            degrade_reason=degrade_reason.value,
+                            evidence_source="none",
                         )
-                        for e in cached_evidence
-                    ]
+                        _msg = "检索超时，无法获取相关证据，且当前会话无缓存证据，请稍后重试。" \
+                            if degrade_reason == DegradeReason.RETRIEVAL_TIMEOUT \
+                            else "检索异常，无法获取相关证据，且当前会话无缓存证据，请稍后重试。"
+                        yield f"event: content\ndata: {json.dumps({'chunk': _msg})}\n\n"
+                else:
+                    await _clear_evidence_cache(session_id)
+                    log.info("retrieval.evidence_source", source="live_empty", session_id=session_id)
+            else:
+                cached_pages, found_cache, fetch_incomplete = await _build_pages_from_cache(session_id)
+                if found_cache:
+                    pages = cached_pages
+                    image_fetch_incomplete = fetch_incomplete
+                    evidence_source = "cached"
+                    log.info("retrieval.evidence_source", source="cached", session_id=session_id, pages=len(pages))
                 else:
                     degraded = True
                     degrade_reason = DegradeReason.NO_EVIDENCE
                     evidence_source = "none"
                     answer = "当前会话尚无可复用的检索证据，请开启「检索数据」后再提问，或先进行一次检索。"
+                    log.warning("retrieval.evidence_source", source="none", session_id=session_id)
                     yield f"event: content\ndata: {json.dumps({'chunk': answer})}\n\n"
 
             evidence: list[EvidenceSummary] = [
@@ -760,6 +812,11 @@ async def query_report_stream(req: QueryRequest):
             yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence]})}\n\n"
 
             if not degraded and pages:
+                # cached_fallback: notify user before streaming answer
+                if evidence_source == "cached_fallback":
+                    _notice = "（本次检索失败，已自动复用上次证据继续回答）\n\n"
+                    yield f"event: content\ndata: {json.dumps({'chunk': _notice})}\n\n"
+
                 # First pass streaming
                 t0 = time.monotonic()
                 first_pass_answer = ""
@@ -937,7 +994,15 @@ async def query_report_stream(req: QueryRequest):
             log.error("stream_fatal_error", session_id=session_id, error=str(exc))
             yield f"event: error\ndata: {json.dumps({'code': 'internal_error', 'message': str(exc)})}\n\n"
 
-    return StreamingResponse(sse_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{report_id}")
