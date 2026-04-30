@@ -124,7 +124,7 @@
 
         <div class="border-t border-[#1E293B] px-4 py-3">
           <div class="mb-2 grid grid-cols-1 md:grid-cols-12 gap-2">
-            <input id="chat-companies" type="text" placeholder="公司过滤（可选，逗号分隔）" class="md:col-span-8 bg-[#1E293B] border border-[#334155] rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-cta placeholder-slate-600">
+            <input id="chat-companies" type="text" placeholder="Report ID 过滤（可选，逗号分隔，如 boa_2024_p001,boa_2024_p002）" class="md:col-span-8 bg-[#1E293B] border border-[#334155] rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-cta placeholder-slate-600">
             <select id="chat-topk" class="md:col-span-2 bg-[#1E293B] border border-[#334155] rounded-lg px-2 py-2 text-xs focus:outline-none focus:border-cta">
               <option value="3">Top 3</option>
               <option value="5" selected>Top 5</option>
@@ -553,7 +553,7 @@
           refresh_retrieval: false,
         };
         if (companies.length) {
-          body.target_companies = companies;
+          body.report_ids = companies;
         }
 
         const controller = new AbortController();
@@ -645,9 +645,15 @@
 
       const wrap = document.getElementById('chat-messages');
       const botDiv = document.createElement('div');
-      botDiv.id = 'stream-bot-msg';
       botDiv.className = 'flex gap-3';
-      botDiv.innerHTML = `${botAvatar()}<div class="msg-bot px-4 py-3 text-sm text-slate-200 max-w-3xl"><div id="stream-answer-text"></div><div id="stream-answer-meta"></div></div>`;
+      const answerEl = document.createElement('div');
+      const metaEl = document.createElement('div');
+      const innerDiv = document.createElement('div');
+      innerDiv.className = 'msg-bot px-4 py-3 text-sm text-slate-200 max-w-3xl';
+      innerDiv.appendChild(answerEl);
+      innerDiv.appendChild(metaEl);
+      botDiv.innerHTML = botAvatar();
+      botDiv.appendChild(innerDiv);
       wrap.appendChild(botDiv);
       wrap.scrollTop = wrap.scrollHeight;
 
@@ -674,7 +680,7 @@
           refresh_retrieval: false,
         };
         if (companies.length) {
-          body.target_companies = companies;
+          body.report_ids = companies;
         }
 
         const response = await fetch(`${API}/reports/query/stream`, {
@@ -722,8 +728,7 @@
                   setActiveSession(meta.session_id, true);
                 }
               } catch {}
-              const answerEl = document.getElementById('stream-answer-text');
-              if (answerEl) answerEl.innerHTML = '';
+              answerEl.innerHTML = '';
             } else if (eventName === 'evidence') {
               try {
                 const ev = JSON.parse(dataStr);
@@ -742,19 +747,13 @@
                 const c = JSON.parse(dataStr);
                 if (c.chunk) {
                   currentAnswer += c.chunk;
-                  const answerEl = document.getElementById('stream-answer-text');
-                  if (answerEl) {
-                    answerEl.innerHTML = formatAnswer(currentAnswer);
-                  }
+                  answerEl.innerHTML = formatAnswer(currentAnswer);
                   wrap.scrollTop = wrap.scrollHeight;
                 }
               } catch {}
             } else if (eventName === 'second_pass') {
               currentAnswer = '';
-              const answerEl = document.getElementById('stream-answer-text');
-              if (answerEl) {
-                answerEl.innerHTML = '<div class="text-slate-400 text-xs">正在扩展检索更多页面...</div>';
-              }
+              answerEl.innerHTML = '<div class="text-slate-400 text-xs">正在扩展检索更多页面...</div>';
             } else if (eventName === 'done') {
               try {
                 const doneData = JSON.parse(dataStr);
@@ -762,10 +761,10 @@
                 currentDegradeReason = doneData.degrade_reason || 'none';
                 currentEvidenceSource = doneData.evidence_source || null;
               } catch {}
-              const metaEl = document.getElementById('stream-answer-meta');
-              if (metaEl) {
-                metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
+              if (!currentAnswer) {
+                answerEl.innerHTML = '<span class="text-slate-400">（无回答内容）</span>';
               }
+              metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
               if (currentEvidence && currentEvidence.length) {
                 updateEvidenceStatus(true);
               }
@@ -773,19 +772,14 @@
               try {
                 const errData = JSON.parse(dataStr);
                 currentAnswer = `错误：${errData.message || errData.code || '未知错误'}`;
-                const answerEl = document.getElementById('stream-answer-text');
-                if (answerEl) {
-                  answerEl.innerHTML = `<span class="text-red-400">${escHtml(currentAnswer)}</span>`;
-                }
+                answerEl.innerHTML = `<span class="text-red-400">${escHtml(currentAnswer)}</span>`;
               } catch {}
-              const metaEl = document.getElementById('stream-answer-meta');
-              if (metaEl) metaEl.innerHTML = '';
+              metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
             }
           }
         }
 
-        const metaEl = document.getElementById('stream-answer-meta');
-        if (metaEl && !metaEl.innerHTML) {
+        if (!metaEl.innerHTML) {
           metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
         }
 
@@ -800,13 +794,9 @@
 
       } catch (error) {
         if (error.name === 'AbortError') {
-          const answerEl = document.getElementById('stream-answer-text');
-          if (answerEl) {
-            answerEl.innerHTML += '<div class="text-slate-500 text-xs mt-2">[已停止]</div>';
-          }
+          answerEl.innerHTML += '<div class="text-slate-500 text-xs mt-2">[已停止]</div>';
         } else {
-          const botWrap = document.getElementById('stream-bot-msg');
-          if (botWrap) botWrap.remove();
+          botDiv.remove();
           const message = `查询失败：${error.message || '未知错误'}`;
           appendBotMsg({ answerHtml: `<span class="text-red-400">${escHtml(message)}</span>` });
         }
@@ -841,7 +831,7 @@
       }
     }
 
-    const PDF_CHUNK_SIZE = 20;
+    const PDF_CHUNK_SIZE = 4;
 
     async function uploadSingleFile(fileOrBlob, reportId) {
       const fd = new FormData();
@@ -895,7 +885,7 @@
       const detail = document.getElementById('upload-detail');
 
       const arrayBuffer = await file.arrayBuffer();
-      const srcDoc = await PDFLib.PDFDocument.load(arrayBuffer);
+      const srcDoc = await PDFLib.PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
       const totalPages = srcDoc.getPageCount();
       const totalChunks = Math.ceil(totalPages / PDF_CHUNK_SIZE);
 
@@ -909,7 +899,12 @@
         detail.textContent = '';
 
         const chunkDoc = await PDFLib.PDFDocument.create();
-        const pages = await chunkDoc.copyPages(srcDoc, Array.from({ length: endPage - startPage }, (_, k) => startPage + k));
+        let pages;
+        try {
+          pages = await chunkDoc.copyPages(srcDoc, Array.from({ length: endPage - startPage }, (_, k) => startPage + k));
+        } catch (copyErr) {
+          throw new Error(`PDF 第 ${startPage + 1}-${endPage} 页复制失败（页树损坏）：${copyErr.message}`);
+        }
         pages.forEach(p => chunkDoc.addPage(p));
         const bytes = await chunkDoc.save();
         const blob = new Blob([bytes], { type: 'application/pdf' });

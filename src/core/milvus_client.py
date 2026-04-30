@@ -156,6 +156,52 @@ def delete_report_data(report_id: str) -> None:
     )
 
 
+# Maximum rows fetched when enumerating report inventory.
+# Zilliz Cloud hard-caps query limit at 16384; use a safe value.
+_INVENTORY_PAGE_SIZE = 16_000
+
+
+def list_reports_inventory(max_rows: int = _INVENTORY_PAGE_SIZE) -> dict:
+    """Read-only: enumerate all report_ids in the pages collection and count pages per report."""
+    client = get_client()
+    col = get_pages_collection_name()
+
+    if not client.has_collection(col):
+        return {
+            "collection": col,
+            "reports": [],
+            "total_reports": 0,
+            "total_rows_fetched": 0,
+            "truncated": False,
+            "max_rows": max_rows,
+        }
+
+    rows = client.query(
+        collection_name=col,
+        filter="",
+        output_fields=["report_id", "page_num"],
+        limit=max_rows,
+    )
+
+    groups: dict[str, list[int]] = {}
+    for r in rows:
+        groups.setdefault(r.get("report_id", ""), []).append(r.get("page_num", 0))
+
+    reports = [
+        {"report_id": rid, "page_count": len(pages), "page_nums": sorted(pages)}
+        for rid, pages in sorted(groups.items())
+    ]
+
+    return {
+        "collection": col,
+        "reports": reports,
+        "total_reports": len(reports),
+        "total_rows_fetched": len(rows),
+        "truncated": len(rows) >= max_rows,
+        "max_rows": max_rows,
+    }
+
+
 def clear_report_collections() -> dict:
     """Drop and recreate only the configured report collections."""
     client = get_client()

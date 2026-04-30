@@ -136,15 +136,23 @@ def _compress_image_base64(b64_str: str) -> tuple[str, int, int]:
         return b64_str, original_bytes, original_bytes
 
 
+_NO_EVIDENCE_NOTE = (
+    "[注意] 当前问题未检索到相关上传文档证据，以下回答基于模型通用知识，"
+    "不代表任何具体财报或公司数据，请以实际文件为准。\n\n"
+)
+
+
 def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
     """Build VLM message list with financial-document analysis instructions.
 
     Structure: system instruction (text) → user query (text) → page images.
+    When pages is empty, a text-only message is built with a no-evidence note.
     Applies outbound image compression per VLM_IMG_* settings before sending.
     """
+    prefix = _NO_EVIDENCE_NOTE if not pages else ""
     content: list[dict] = [
         {"type": "text", "text": _FIN_DOC_SYSTEM},
-        {"type": "text", "text": query},
+        {"type": "text", "text": prefix + query},
     ]
     total_orig, total_comp, img_count = 0, 0, 0
     for p in pages[: settings.MAX_VLM_IMAGES]:
@@ -275,9 +283,6 @@ async def stream_generate_answer(
     Any exception propagates to the caller (StreamingResponse) so it can be
     translated into an SSE error event.
     """
-    if not pages:
-        return
-
     config_err = _check_vlm_config()
     if config_err:
         log.warning("vlm.config_missing", reason=config_err, query=query)
@@ -297,9 +302,6 @@ async def generate_answer(
 
     If timeout or any exception occurs, returns (None, reason).
     """
-    if not pages:
-        return None, DegradeReason.NONE
-
     # --- Config guard: fail fast with observable reason ---
     config_err = _check_vlm_config()
     if config_err:

@@ -25,7 +25,7 @@ from ..services.vlm_service import (
 )
 from ..services.task_service import submit_ingest_task, get_task
 from ..core.redis_client import get_redis
-from ..core.milvus_client import clear_report_collections
+from ..core.milvus_client import clear_report_collections, list_reports_inventory
 
 # Redis key: session:{session_id}  TTL: 2 days
 _SESSION_TTL = 2 * 86400
@@ -63,6 +63,7 @@ def _is_valid_image(data: bytes, ext: str) -> bool:
 class QueryRequest(BaseModel):
     question: str
     target_companies: list[str] = []
+    report_ids: list[str] = []
     top_k: int = 5
     candidate_k: int = 50
     session_id: str | None = None
@@ -298,6 +299,37 @@ async def _release_redis_maintenance(r) -> None:
     await r.delete(_MAINTENANCE_REDIS_KEY)
 
 
+@router.get("/admin/inventory")
+async def get_reports_inventory():
+    """只读：枚举 pages 集合中所有 report_id 及其页数统计。"""
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, list_reports_inventory)
+        return result
+    except Exception as exc:
+        log.error("inventory_failed", error=str(exc))
+        raise HTTPException(500, f"查询报告清单失败: {exc}")
+
+
+@router.get("/admin/inventory/{report_id}")
+async def check_report_in_inventory(report_id: str):
+    """只读：检查指定 report_id 是否已入库，返回页数统计。"""
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, list_reports_inventory)
+    except Exception as exc:
+        log.error("inventory_check_failed", report_id=report_id, error=str(exc))
+        raise HTTPException(500, f"查询报告清单失败: {exc}")
+
+    matched = next((r for r in result["reports"] if r["report_id"] == report_id), None)
+    return {
+        "report_id": report_id,
+        "found": matched is not None,
+        "page_count": matched["page_count"] if matched else 0,
+        "page_nums": matched["page_nums"] if matched else [],
+        "collection": result["collection"],
+        "truncated": result["truncated"],
+    }
+
+
 @router.post("/admin/clear-collections", status_code=200)
 async def clear_collections():
     global _maintenance_active
@@ -374,13 +406,18 @@ async def query_report(req: QueryRequest):
 
     if run_retrieval:
         try:
+            _loop = asyncio.get_event_loop()
+            _pool = getattr(_loop, "_default_executor", None)
+            _pool_info = f"threads={getattr(_pool, '_max_workers', '?')} queue={getattr(getattr(_pool, '_work_queue', None), 'qsize', lambda: '?')()}" if _pool else "default(not-init)"
+            log.info("retrieval.submit", session_id=session_id, executor_info=_pool_info, timeout=settings.QUERY_TIMEOUT)
             pages = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
+                _loop.run_in_executor(
                     None,
-                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass"),
+                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass", req.report_ids or None),
                 ),
                 timeout=settings.QUERY_TIMEOUT,
             )
+            log.info("retrieval.submit_done", session_id=session_id, pages=len(pages))
         except asyncio.TimeoutError:
             log.error("query_timeout", session_id=session_id, question=req.question)
             degraded = True
@@ -496,6 +533,7 @@ async def query_report(req: QueryRequest):
                             settings.VLM_SECOND_PASS_TOP_K,
                             settings.VLM_SECOND_PASS_CANDIDATE_K,
                             "second_pass",
+                            req.report_ids or None,
                         ),
                     ),
                     timeout=settings.QUERY_TIMEOUT,
@@ -551,7 +589,11 @@ async def query_report(req: QueryRequest):
             log.info("vlm.market_boundary_hint_appended", session_id=session_id, question=req.question)
 
     elif not degraded and not pages:
-        answer = "未找到相关页面。"
+        # No retrieval results — call VLM text-only with no-evidence note
+        answer, vlm_reason = await generate_answer(req.question, [])
+        if not answer or vlm_reason != DegradeReason.NONE:
+            answer = "未找到相关页面。"
+        evidence_source = "none"
 
     evidence: list[EvidenceSummary] = [
         EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
@@ -627,7 +669,7 @@ async def query_report_stream(req: QueryRequest):
                     pages = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass"),
+                            lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass", req.report_ids or None),
                         ),
                         timeout=settings.QUERY_TIMEOUT,
                     )
@@ -635,12 +677,16 @@ async def query_report_stream(req: QueryRequest):
                     log.error("query_timeout", session_id=session_id, question=req.question)
                     degraded = True
                     degrade_reason = DegradeReason.RETRIEVAL_TIMEOUT
+                    evidence_source = "none"
                     pages = []
+                    yield f"event: content\ndata: {json.dumps({'chunk': '检索超时，无法获取相关证据，请稍后重试。'})}\n\n"
                 except Exception:
                     log.exception("query_failed", session_id=session_id, question=req.question)
                     degraded = True
                     degrade_reason = DegradeReason.RETRIEVAL_ERROR
+                    evidence_source = "none"
                     pages = []
+                    yield f"event: content\ndata: {json.dumps({'chunk': '检索异常，无法获取相关证据，请稍后重试。'})}\n\n"
 
                 if pages:
                     await _save_evidence_cache(session_id, pages)
@@ -703,6 +749,7 @@ async def query_report_stream(req: QueryRequest):
                     degrade_reason = DegradeReason.NO_EVIDENCE
                     evidence_source = "none"
                     answer = "当前会话尚无可复用的检索证据，请开启「检索数据」后再提问，或先进行一次检索。"
+                    yield f"event: content\ndata: {json.dumps({'chunk': answer})}\n\n"
 
             evidence: list[EvidenceSummary] = [
                 EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
@@ -771,6 +818,7 @@ async def query_report_stream(req: QueryRequest):
                                     settings.VLM_SECOND_PASS_TOP_K,
                                     settings.VLM_SECOND_PASS_CANDIDATE_K,
                                     "second_pass",
+                                    req.report_ids or None,
                                 ),
                             ),
                             timeout=settings.QUERY_TIMEOUT,
@@ -827,9 +875,19 @@ async def query_report_stream(req: QueryRequest):
                     log.info("vlm.market_boundary_hint_appended", session_id=session_id, question=req.question)
 
             elif not degraded and not pages:
-                answer = "未找到相关页面。"
+                # No retrieval results — stream VLM text-only with no-evidence note
                 evidence_source = "none"
-                yield f"event: content\ndata: {json.dumps({'chunk': answer})}\n\n"
+                text_only_answer = ""
+                try:
+                    async for chunk in stream_generate_answer(req.question, []):
+                        text_only_answer += chunk
+                        yield f"event: content\ndata: {json.dumps({'chunk': chunk})}\n\n"
+                except Exception as exc:
+                    log.error("vlm.text_only_stream_error", session_id=session_id, error=str(exc))
+                if not text_only_answer:
+                    text_only_answer = "未找到相关页面。"
+                    yield f"event: content\ndata: {json.dumps({'chunk': text_only_answer})}\n\n"
+                answer = text_only_answer
 
             if degraded and answer and not vlm_passes:
                 evidence_source = "none"

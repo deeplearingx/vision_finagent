@@ -336,6 +336,8 @@ curl http://localhost:8000/ready
 | GET | `/reports/sessions` | 获取会话列表 |
 | GET | `/reports/sessions/{session_id}/history` | 获取对话历史 |
 | GET | `/reports/sessions/{session_id}/evidence-status` | 获取当前会话 evidence 可复用状态 |
+| GET | `/reports/admin/inventory` | 只读：枚举所有已入库报告及页数统计 |
+| GET | `/reports/admin/inventory/{report_id}` | 只读：检查指定 report_id 是否已入库 |
 | POST | `/reports/admin/clear-collections` | 清空并重建当前 Milvus 集合 |
 | GET | `/reports/{report_id}` | 报告状态占位接口 |
 
@@ -422,6 +424,66 @@ curl -X POST http://localhost:8000/reports/query \
 
 ---
 
+## 报告清单示例
+
+查看所有已入库报告：
+
+```bash
+curl http://localhost:8000/reports/admin/inventory
+```
+
+返回示例：
+
+```json
+{
+  "collection": "fin_vision_reports_v2_pages",
+  "total_reports": 2,
+  "total_rows_fetched": 310,
+  "truncated": false,
+  "max_rows": 16000,
+  "reports": [
+    {"report_id": "bank_of_america_2024", "page_count": 305, "page_nums": [1, 2, "..."]},
+    {"report_id": "gupiao", "page_count": 5, "page_nums": [1, 2, 3, 4, 5]}
+  ]
+}
+```
+
+确认某个报告是否已入库：
+
+```bash
+curl http://localhost:8000/reports/admin/inventory/bank_of_america_2024
+```
+
+返回示例（已入库）：
+
+```json
+{
+  "report_id": "bank_of_america_2024",
+  "found": true,
+  "page_count": 305,
+  "page_nums": [1, 2, 3, "..."],
+  "collection": "fin_vision_reports_v2_pages",
+  "truncated": false
+}
+```
+
+返回示例（未入库）：
+
+```json
+{
+  "report_id": "bank_of_america_2024",
+  "found": false,
+  "page_count": 0,
+  "page_nums": [],
+  "collection": "fin_vision_reports_v2_pages",
+  "truncated": false
+}
+```
+
+> `truncated: true` 表示库中行数超过 `max_rows`（默认 16000），结果可能不完整。
+
+---
+
 ## 会话历史示例
 
 ```bash
@@ -457,6 +519,8 @@ FastAPI
 ├── /reports/upload
 ├── /reports/tasks/{task_id}
 ├── /reports/query
+├── /reports/admin/inventory
+├── /reports/admin/inventory/{report_id}
 ├── /reports/admin/clear-collections
 ├── /reports/sessions
 ├── /reports/sessions/{session_id}/history

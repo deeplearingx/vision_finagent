@@ -1,4 +1,4 @@
-"""Tests for VLM outbound image compression."""
+"""Tests for image compression utilities."""
 import base64
 import io
 import pytest
@@ -63,3 +63,24 @@ def test_compress_disabled_when_both_zero():
 
     assert result == b64
     assert orig_b == comp_b
+
+
+# ---------------------------------------------------------------------------
+# to_base64_bounded – DB field length guard
+# ---------------------------------------------------------------------------
+
+def test_bounded_large_image_within_limit():
+    """A large synthetic image must encode to < 65536 chars."""
+    from src.utils.image import to_base64_bounded, _DB_B64_LIMIT
+    img = Image.new("RGB", (3000, 2000), color=(200, 100, 50))
+    b64 = to_base64_bounded(img)
+    assert len(b64) < _DB_B64_LIMIT
+
+
+def test_bounded_small_image_within_limit():
+    """A small image must also satisfy the limit (sanity check)."""
+    from src.utils.image import to_base64_bounded, _DB_B64_LIMIT
+    img = Image.new("RGB", (100, 100), color=(10, 20, 30))
+    b64 = to_base64_bounded(img)
+    assert len(b64) < _DB_B64_LIMIT
+    assert len(b64) > 0

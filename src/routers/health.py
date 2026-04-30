@@ -47,12 +47,13 @@ async def ready():
     if is_cpu_fallback() and not settings.REQUIRE_RETRIEVAL_GPU:
         return JSONResponse(status_code=200, content={
             "status": "ready",
+            "retrieval_degraded": True,
             "degraded": True,
             "reason": "cpu_fallback",
             "detail": f"CUDA available but model on CPU (first_param={get_model_device()}, hf_device_map={get_hf_device_map()})",
         })
 
-    return {"status": "ready"}
+    return {"status": "ready", "retrieval_degraded": False}
 
 
 @router.get("/schema-health")

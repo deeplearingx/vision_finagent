@@ -1,4 +1,5 @@
 import json
+import time
 import structlog
 from typing import List
 
@@ -241,84 +242,101 @@ def retrieve(
     top_k: int = 5,   # aligned with frontend default Top-5
     candidate_k: int = 50,
     pass_label: str = "first_pass",  # observability: "first_pass" | "second_pass"
+    report_ids: List[str] | None = None,
 ) -> List[PageResult]:
+    import threading
+    log.info("retrieval.entered", pass_label=pass_label, thread=threading.current_thread().name, query=query[:80])
     model, processor = _load_model()
 
     input_device = _get_input_device()
     log.info("retrieval.query_device", input_device=input_device,
              hf_device_map=getattr(model, "hf_device_map", None))
+
+    # Stage 0: query embedding
+    t0 = time.monotonic()
     with torch.no_grad():
         batch = processor.process_queries([query]).to(input_device)
         q_emb = model(**batch)  # (1, nq, 128)
-
-    q_vecs = q_emb[0].cpu().float().numpy()  # (nq, 128) — no mean pooling
+    q_vecs = q_emb[0].cpu().float().numpy()  # (nq, 128)
+    # Mean-pool query vectors for ANN search to reduce Milvus round-trips
+    # (nq vectors → 1 vector; MaxSim re-ranking still uses full q_vecs)
+    q_vecs_search = q_vecs.mean(axis=0, keepdims=True)  # (1, 128)
+    log.info("retrieval.timing", stage="query_embedding", elapsed=round(time.monotonic() - t0, 3),
+             pass_label=pass_label, nq=len(q_vecs))
 
     client = get_client()
     name = get_collection_name()
 
-    # Build company pre-filter for Milvus search stage.
-    # Pushing the filter into search() reduces ANN result set before Python-side
-    # post-processing, improving recall quality when candidate_k is fixed.
-    # Milvus `like` supports prefix wildcards; semantics match the old
-    # `startswith(t + "_") or rid == t` post-filter exactly.
-    company_filter = _build_company_filter(target_companies)
-    log.info("retrieval.company_filter", filter=company_filter,
-             target_companies=target_companies)
+    # report_ids takes priority over target_companies for exact filtering
+    if report_ids:
+        import json as _json
+        clauses = [f'report_id == {_json.dumps(r)}' for r in report_ids]
+        milvus_filter: str | None = "(" + " or ".join(clauses) + ")"
+        log.info("retrieval.report_ids_filter", filter=milvus_filter, report_ids=report_ids)
+    else:
+        milvus_filter = _build_company_filter(target_companies)
+        log.info("retrieval.company_filter", filter=milvus_filter,
+                 target_companies=target_companies)
 
     search_kwargs: dict = dict(
         collection_name=name,
-        data=q_vecs.tolist(),
         anns_field="colpali_embeddings",
         search_params={"metric_type": "IP", "params": {"nprobe": 10}},
         limit=candidate_k,
         output_fields=["report_id", "page_num"],
     )
-    if company_filter:
-        search_kwargs["filter"] = company_filter
+    if milvus_filter:
+        search_kwargs["filter"] = milvus_filter
 
-    # Stage 1: per-query-token ANN recall → candidate pages (company-filtered)
-    results = client.search(**search_kwargs)
+    # Stage 1: ANN search
+    t1 = time.monotonic()
+    _NQ_BATCH = settings.MILVUS_NQ_BATCH
+    all_vecs = q_vecs.tolist()
+    search_vecs = q_vecs_search.tolist()  # 1 mean-pooled vector
+    log.info("retrieval.ann_start", total_vecs=len(all_vecs), search_vecs=len(search_vecs), pass_label=pass_label)
+    results = []
+    for i in range(0, len(search_vecs), _NQ_BATCH):
+        tb = time.monotonic()
+        results.extend(client.search(data=search_vecs[i:i + _NQ_BATCH], **search_kwargs))
+        log.info("retrieval.ann_batch", batch=i // _NQ_BATCH, elapsed=round(time.monotonic() - tb, 3), pass_label=pass_label)
+    log.info("retrieval.timing", stage="milvus_ann_search", elapsed=round(time.monotonic() - t1, 3), pass_label=pass_label)
 
-    # Collect unique (report_id, page_num) candidates.
-    # Python-side filter retained as safety net in case Milvus `like` semantics
-    # differ across versions (e.g. older Milvus Lite may not support `like`).
     candidates: set[tuple[str, int]] = set()
     for hits in results:
         for hit in hits:
             rid = hit["entity"]["report_id"]
-            if target_companies and not any(rid.startswith(t + "_") or rid == t for t in target_companies):
+            if report_ids and rid not in report_ids:
+                continue
+            if not report_ids and target_companies and not any(rid.startswith(t + "_") or rid == t for t in target_companies):
                 continue
             candidates.add((rid, hit["entity"]["page_num"]))
 
     log.info("retrieval.candidates", count=len(candidates), query=query,
-             company_filter_applied=company_filter is not None, pass_label=pass_label)
+             filter_applied=milvus_filter is not None, pass_label=pass_label)
     if not candidates:
         log.warning("retrieval.no_candidates", query=query)
         return []
 
-    # Stage 2a: fetch patch vectors (no image_base64)
-    # Build per-report filter to avoid cross-product false positives
-    # e.g. report_A page 3 and report_B page 3 are different pages
+    # Stage 2a: fetch patch vectors
     from collections import defaultdict
     rid_to_pnums: dict[str, list[int]] = defaultdict(list)
     for r, p in candidates:
         rid_to_pnums[r].append(p)
 
-    # Milvus Lite hard limit is 16384 rows per query call.
-    # Each page has ~1024 patches, so we batch by report to stay under the limit.
     _MILVUS_QUERY_LIMIT = 16384
+    t2 = time.monotonic()
     patch_rows: list = []
     for r, pnums in rid_to_pnums.items():
-        clause = f"(report_id == {json.dumps(r)} and page_num in {json.dumps(pnums)})"
-        batch_limit = min(len(pnums) * 1024 + 1, _MILVUS_QUERY_LIMIT)
-        patch_rows.extend(client.query(
-            collection_name=name,
-            filter=clause,
-            output_fields=["report_id", "page_num", "colpali_embeddings"],
-            limit=batch_limit,
-        ))
+        for pnum in pnums:
+            clause = f"(report_id == {json.dumps(r)} and page_num == {pnum})"
+            patch_rows.extend(client.query(
+                collection_name=name,
+                filter=clause,
+                output_fields=["report_id", "page_num", "colpali_embeddings"],
+                limit=_MILVUS_QUERY_LIMIT,
+            ))
+    log.info("retrieval.timing", stage="patch_vector_query", elapsed=round(time.monotonic() - t2, 3), pass_label=pass_label)
 
-    # Group patch vectors by page
     pages: dict[tuple[str, int], list] = {}
     for row in patch_rows:
         key = (row["report_id"], row["page_num"])
@@ -326,7 +344,8 @@ def retrieve(
             continue
         pages.setdefault(key, []).append(row["colpali_embeddings"])
 
-    # Stage 2b: fetch page metadata (image_base64) from pages collection
+    # Stage 2b: fetch page metadata
+    t3 = time.monotonic()
     page_ids = [f"{r}_{p}" for r, p in pages]
     meta_rows = client.query(
         collection_name=get_pages_collection_name(),
@@ -334,6 +353,7 @@ def retrieve(
         output_fields=["report_id", "page_num", "image_base64"],
         limit=len(page_ids) + 1,
     )
+    log.info("retrieval.timing", stage="page_meta_query", elapsed=round(time.monotonic() - t3, 3), pass_label=pass_label)
     page_meta: dict[tuple[str, int], str] = {
         (r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows
     }

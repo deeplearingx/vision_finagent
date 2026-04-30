@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     MILVUS_TOKEN: str = ""          # Zilliz Cloud API token; leave empty for local/self-hosted
     MILVUS_DB_NAME: str = "default" # Zilliz Cloud database name; "default" for most cases
     MILVUS_COLLECTION: str = "fin_vision_reports"
+    MILVUS_NQ_BATCH: int = 10  # Zilliz Cloud limits nq<=10 per search; set higher for self-hosted
 
     REDIS_URL: str = "redis://localhost:6379/0"
 
@@ -60,7 +61,7 @@ class Settings(BaseSettings):
 
     INGEST_TIMEOUT: int = 300      # seconds for ingestion task
     INGEST_WORKERS: int = 2        # background thread pool for ingestion
-    QUERY_TIMEOUT: int = 15        # seconds for retrieval API call
+    QUERY_TIMEOUT: int = 60        # seconds for retrieval API call
 
     def validate_model_paths(self) -> None:
         """Fail fast if MODEL_PATH is a LoRA adapter dir but BASE_MODEL_PATH is not set."""
