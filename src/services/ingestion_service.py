@@ -1,4 +1,5 @@
 import asyncio
+import os
 import structlog
 import torch
 from typing import List
@@ -6,7 +7,7 @@ from PIL import Image
 import fitz  # pymupdf
 from ..core.milvus_client import get_client, get_collection_name, get_pages_collection_name, delete_report_data
 from ..core.exception import IngestionError, RollbackError
-from ..utils.image import to_base64_bounded
+from ..utils.image import to_base64_bounded, save_page_image
 from ..utils.lock import DistributedLock
 from . import retrieval_service
 from ..config import settings
@@ -37,13 +38,18 @@ def _iter_pdf_pages(path: str, dpi: int = 150):
         doc = fitz.open(path)
         if doc.page_count == 0:
             raise IngestionError(f"PDF 文件不含任何页面：{path!r}")
+        if doc.page_count > settings.MAX_PDF_PAGES:
+            raise IngestionError(f"PDF 页数过多：{doc.page_count} 页，当前限制为 {settings.MAX_PDF_PAGES} 页")
         ok_pages = 0
         bad_pages = []
         for i in range(doc.page_count):
             page_num = i + 1
             try:
                 page = doc.load_page(i)
-                pix = page.get_pixmap(dpi=dpi, alpha=False)
+                pix = page.get_pixmap(dpi=settings.PDF_RENDER_DPI, alpha=False)
+                pixels = pix.width * pix.height
+                if pixels > settings.MAX_RENDERED_PAGE_PIXELS:
+                    raise IngestionError(f"页面像素过大：page={page_num}, {pix.width}x{pix.height}={pixels}, limit={settings.MAX_RENDERED_PAGE_PIXELS}")
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 ok_pages += 1
                 yield page_num, img
@@ -105,12 +111,14 @@ def _process_batch(
         result = client.insert(collection_name=name, data=rows)
         inserted_patch_pks.extend(result["ids"])
 
-        b64 = to_base64_bounded(image)
+        image_path = save_page_image(image, report_id, page_num)
+        thumb_b64 = to_base64_bounded(image)
         client.upsert(collection_name=pages_name, data=[{
             "page_id": page_id,
             "report_id": report_id,
             "page_num": page_num,
-            "image_base64": b64,
+            "image_base64": thumb_b64,
+            "image_path": image_path,
             "_vec": [0.0, 0.0],
         }])
         inserted_page_ids.append(page_id)
@@ -140,17 +148,24 @@ async def ingest_report(report_id: str, image_paths: List[str]) -> None:
                     batch: list[tuple] = []
                     all_pks: list = []
                     all_pids: list[str] = []
-                    for page_num, image in _iter_pdf_pages(repaired, dpi=150):
-                        batch.append((page_num, image))
-                        if len(batch) >= settings.MAX_BATCH_SIZE:
+                    try:
+                        for page_num, image in _iter_pdf_pages(repaired):
+                            batch.append((page_num, image))
+                            if len(batch) >= settings.MAX_BATCH_SIZE:
+                                pks, pids = _process_batch(report_id, batch)
+                                all_pks.extend(pks)
+                                all_pids.extend(pids)
+                                batch.clear()
+                        if batch:
                             pks, pids = _process_batch(report_id, batch)
                             all_pks.extend(pks)
                             all_pids.extend(pids)
-                            batch.clear()
-                    if batch:
-                        pks, pids = _process_batch(report_id, batch)
-                        all_pks.extend(pks)
-                        all_pids.extend(pids)
+                    finally:
+                        if repaired != p:
+                            try:
+                                os.unlink(repaired)
+                            except Exception as exc:
+                                log.warning("pdf.repaired_cleanup_failed", path=repaired, error=str(exc))
                     return all_pks, all_pids
 
                 pks, pids = await asyncio.to_thread(_ingest_single_pdf)

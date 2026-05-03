@@ -21,6 +21,7 @@ from colpali_engine.models.paligemma.colpali.modeling_colpali import ColPali
 from colpali_engine.models.paligemma.colpali.processing_colpali import ColPaliProcessor
 from ..config import settings
 from ..core.milvus_client import get_client, get_collection_name, get_pages_collection_name
+from ..utils.image import encode_image_file_for_vlm
 from ..models.schema import PageResult
 
 _model: ColPali | None = None
@@ -236,96 +237,138 @@ def _build_company_filter(target_companies: List[str]) -> str | None:
     return "(" + " or ".join(clauses) + ")"
 
 
+def _select_search_vectors(
+    q_vecs: np.ndarray,
+    has_filter: bool,
+) -> tuple[np.ndarray, bool]:
+    """Return (search_vecs, use_multi_vec).
+
+    Degrades to mean-pool when there is no filter (full-collection scan would be too expensive).
+    """
+    if not has_filter or settings.RETRIEVAL_USE_MEAN_POOL_ANN:
+        return q_vecs.mean(axis=0, keepdims=True), False
+    max_vecs = settings.RETRIEVAL_MAX_QUERY_VECS
+    if len(q_vecs) > max_vecs:
+        idx = np.linspace(0, len(q_vecs) - 1, max_vecs, dtype=int)
+        return q_vecs[idx], True
+    return q_vecs, True
+
+
 def retrieve(
     query: str,
     target_companies: List[str],
-    top_k: int = 5,   # aligned with frontend default Top-5
-    candidate_k: int = 50,
-    pass_label: str = "first_pass",  # observability: "first_pass" | "second_pass"
+    top_k: int = 5,
+    candidate_k: int = 80,
+    pass_label: str = "first_pass",
     report_ids: List[str] | None = None,
 ) -> List[PageResult]:
     import threading
-    log.info("retrieval.entered", pass_label=pass_label, thread=threading.current_thread().name, query=query[:80])
-    model, processor = _load_model()
+    from collections import defaultdict
+    total_t0 = time.monotonic()
+    log.info("retrieval.start", pass_label=pass_label,
+             thread=threading.current_thread().name, query=query[:80],
+             top_k=top_k, candidate_k=candidate_k,
+             report_ids=report_ids, target_companies=target_companies)
 
+    model, processor = _load_model()
     input_device = _get_input_device()
-    log.info("retrieval.query_device", input_device=input_device,
-             hf_device_map=getattr(model, "hf_device_map", None))
 
     # Stage 0: query embedding
     t0 = time.monotonic()
     with torch.no_grad():
         batch = processor.process_queries([query]).to(input_device)
-        q_emb = model(**batch)  # (1, nq, 128)
+        q_emb = model(**batch)
     q_vecs = q_emb[0].cpu().float().numpy()  # (nq, 128)
-    # Mean-pool query vectors for ANN search to reduce Milvus round-trips
-    # (nq vectors → 1 vector; MaxSim re-ranking still uses full q_vecs)
-    q_vecs_search = q_vecs.mean(axis=0, keepdims=True)  # (1, 128)
-    log.info("retrieval.timing", stage="query_embedding", elapsed=round(time.monotonic() - t0, 3),
-             pass_label=pass_label, nq=len(q_vecs))
+    log.info("retrieval.query_encoded", nq=len(q_vecs), dim=q_vecs.shape[-1],
+             elapsed=round(time.monotonic() - t0, 3), pass_label=pass_label)
 
     client = get_client()
     name = get_collection_name()
 
-    # report_ids takes priority over target_companies for exact filtering
+    # Build Milvus filter
     if report_ids:
-        import json as _json
-        clauses = [f'report_id == {_json.dumps(r)}' for r in report_ids]
+        clauses = [f'report_id == {json.dumps(r)}' for r in report_ids]
         milvus_filter: str | None = "(" + " or ".join(clauses) + ")"
-        log.info("retrieval.report_ids_filter", filter=milvus_filter, report_ids=report_ids)
     else:
         milvus_filter = _build_company_filter(target_companies)
-        log.info("retrieval.company_filter", filter=milvus_filter,
-                 target_companies=target_companies)
+    has_filter = milvus_filter is not None
+    log.info("retrieval.filter", filter=milvus_filter, has_filter=has_filter, pass_label=pass_label)
+
+    # Select search vectors (degrade to mean-pool when no filter)
+    search_vecs_np, use_multi_vec = _select_search_vectors(q_vecs, has_filter)
+    per_vec_limit = settings.RETRIEVAL_PER_VEC_LIMIT if use_multi_vec else candidate_k
+    log.info("retrieval.search_vecs", use_multi_vec=use_multi_vec,
+             search_vecs=len(search_vecs_np), per_vec_limit=per_vec_limit, pass_label=pass_label)
 
     search_kwargs: dict = dict(
         collection_name=name,
         anns_field="colpali_embeddings",
         search_params={"metric_type": "IP", "params": {"nprobe": 10}},
-        limit=candidate_k,
+        limit=per_vec_limit,
         output_fields=["report_id", "page_num"],
     )
     if milvus_filter:
         search_kwargs["filter"] = milvus_filter
 
-    # Stage 1: ANN search
-    t1 = time.monotonic()
+    # Stage 1: ANN search (batched by MILVUS_NQ_BATCH)
+    ann_t0 = time.monotonic()
+    search_vecs = search_vecs_np.tolist()
     _NQ_BATCH = settings.MILVUS_NQ_BATCH
-    all_vecs = q_vecs.tolist()
-    search_vecs = q_vecs_search.tolist()  # 1 mean-pooled vector
-    log.info("retrieval.ann_start", total_vecs=len(all_vecs), search_vecs=len(search_vecs), pass_label=pass_label)
-    results = []
-    for i in range(0, len(search_vecs), _NQ_BATCH):
+    page_ann_stats: dict[tuple[str, int], dict] = defaultdict(
+        lambda: {"hit_count": 0, "best_score": float("-inf")}
+    )
+    for batch_i in range(0, len(search_vecs), _NQ_BATCH):
         tb = time.monotonic()
-        results.extend(client.search(data=search_vecs[i:i + _NQ_BATCH], **search_kwargs))
-        log.info("retrieval.ann_batch", batch=i // _NQ_BATCH, elapsed=round(time.monotonic() - tb, 3), pass_label=pass_label)
-    log.info("retrieval.timing", stage="milvus_ann_search", elapsed=round(time.monotonic() - t1, 3), pass_label=pass_label)
+        vec_batch = search_vecs[batch_i: batch_i + _NQ_BATCH]
+        batch_results = client.search(data=vec_batch, **search_kwargs)
+        for one_query_hits in batch_results:
+            for hit in one_query_hits:
+                entity = hit.get("entity") or {}
+                rid = entity.get("report_id")
+                pnum = entity.get("page_num")
+                if rid is None or pnum is None:
+                    continue
+                # post-filter (safety net when Milvus filter is absent)
+                if report_ids and rid not in report_ids:
+                    continue
+                if not report_ids and target_companies and not any(
+                    rid.startswith(t + "_") or rid == t for t in target_companies
+                ):
+                    continue
+                key = (rid, int(pnum))
+                score = float(hit.get("distance", 0.0))
+                page_ann_stats[key]["hit_count"] += 1
+                page_ann_stats[key]["best_score"] = max(page_ann_stats[key]["best_score"], score)
+        log.info("retrieval.ann_batch", batch=batch_i // _NQ_BATCH,
+                 nq=len(vec_batch), unique_pages=len(page_ann_stats),
+                 elapsed=round(time.monotonic() - tb, 3), pass_label=pass_label)
 
-    candidates: set[tuple[str, int]] = set()
-    for hits in results:
-        for hit in hits:
-            rid = hit["entity"]["report_id"]
-            if report_ids and rid not in report_ids:
-                continue
-            if not report_ids and target_companies and not any(rid.startswith(t + "_") or rid == t for t in target_companies):
-                continue
-            candidates.add((rid, hit["entity"]["page_num"]))
+    log.info("retrieval.ann_done", unique_pages=len(page_ann_stats),
+             elapsed=round(time.monotonic() - ann_t0, 3), pass_label=pass_label)
 
-    log.info("retrieval.candidates", count=len(candidates), query=query,
-             filter_applied=milvus_filter is not None, pass_label=pass_label)
-    if not candidates:
-        log.warning("retrieval.no_candidates", query=query)
+    if not page_ann_stats:
+        log.warning("retrieval.no_candidates", query=query[:80], pass_label=pass_label)
         return []
 
-    # Stage 2a: fetch patch vectors
-    from collections import defaultdict
-    rid_to_pnums: dict[str, list[int]] = defaultdict(list)
-    for r, p in candidates:
-        rid_to_pnums[r].append(p)
+    # Truncate candidates: sort by (hit_count desc, best_score desc), cap at MAX_CANDIDATE_PAGES
+    candidate_items = sorted(
+        page_ann_stats.items(),
+        key=lambda kv: (kv[1]["hit_count"], kv[1]["best_score"]),
+        reverse=True,
+    )[:settings.RETRIEVAL_MAX_CANDIDATE_PAGES]
+    candidate_pages = [key for key, _ in candidate_items]
+    log.info("retrieval.candidate_pages_selected",
+             before=len(page_ann_stats), after=len(candidate_pages),
+             cap=settings.RETRIEVAL_MAX_CANDIDATE_PAGES, pass_label=pass_label)
 
+    # Stage 2a: fetch patch vectors for rerank candidates only
+    rerank_pages = candidate_pages[:settings.RETRIEVAL_RERANK_PAGE_CAP]
     _MILVUS_QUERY_LIMIT = 16384
     t2 = time.monotonic()
     patch_rows: list = []
+    rid_to_pnums: dict[str, list[int]] = defaultdict(list)
+    for r, p in rerank_pages:
+        rid_to_pnums[r].append(p)
     for r, pnums in rid_to_pnums.items():
         for pnum in pnums:
             clause = f"(report_id == {json.dumps(r)} and page_num == {pnum})"
@@ -335,44 +378,59 @@ def retrieve(
                 output_fields=["report_id", "page_num", "colpali_embeddings"],
                 limit=_MILVUS_QUERY_LIMIT,
             ))
-    log.info("retrieval.timing", stage="patch_vector_query", elapsed=round(time.monotonic() - t2, 3), pass_label=pass_label)
+    log.info("retrieval.timing", stage="patch_vector_query",
+             pages=len(rerank_pages), rows=len(patch_rows),
+             elapsed=round(time.monotonic() - t2, 3), pass_label=pass_label)
 
-    pages: dict[tuple[str, int], list] = {}
+    rerank_set = set(rerank_pages)
+    pages_vecs: dict[tuple[str, int], list] = {}
     for row in patch_rows:
         key = (row["report_id"], row["page_num"])
-        if key not in candidates:
+        if key not in rerank_set:
             continue
-        pages.setdefault(key, []).append(row["colpali_embeddings"])
+        pages_vecs.setdefault(key, []).append(row["colpali_embeddings"])
 
     # Stage 2b: fetch page metadata
     t3 = time.monotonic()
-    page_ids = [f"{r}_{p}" for r, p in pages]
+    page_ids = [f"{r}_{p}" for r, p in pages_vecs]
     meta_rows = client.query(
         collection_name=get_pages_collection_name(),
         filter=f"page_id in {json.dumps(page_ids)}",
-        output_fields=["report_id", "page_num", "image_base64"],
+        output_fields=["report_id", "page_num", "image_base64", "image_path"],
         limit=len(page_ids) + 1,
     )
-    log.info("retrieval.timing", stage="page_meta_query", elapsed=round(time.monotonic() - t3, 3), pass_label=pass_label)
-    page_meta: dict[tuple[str, int], str] = {
-        (r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows
-    }
+    log.info("retrieval.timing", stage="page_meta_query",
+             elapsed=round(time.monotonic() - t3, 3), pass_label=pass_label)
 
-    # Score each page with MaxSim
+    page_meta: dict[tuple[str, int], str] = {}
+    for r in meta_rows:
+        key = (r["report_id"], r["page_num"])
+        image_path = r.get("image_path")
+        if image_path:
+            try:
+                page_meta[key] = encode_image_file_for_vlm(image_path)
+                continue
+            except Exception as exc:
+                log.warning("retrieval.highres_image_load_failed",
+                            report_id=r["report_id"], page_num=r["page_num"],
+                            image_path=image_path, error=str(exc))
+        page_meta[key] = r.get("image_base64", "")
+
+    # Stage 3: MaxSim rerank
+    rerank_t0 = time.monotonic()
+    log.info("retrieval.rerank_start", pages=len(pages_vecs), pass_label=pass_label)
     scored: List[PageResult] = []
-    for (rid, pnum), vecs in pages.items():
+    for (rid, pnum), vecs in pages_vecs.items():
         b64 = page_meta.get((rid, pnum), "")
         page_vecs = np.array(vecs, dtype=np.float32)
         score = _maxsim_score(q_vecs, page_vecs)
-        scored.append(PageResult(
-            report_id=rid,
-            page_num=pnum,
-            image_base64=b64,
-            maxsim_score=score,
-        ))
+        scored.append(PageResult(report_id=rid, page_num=pnum, image_base64=b64, maxsim_score=score))
 
     scored.sort(key=lambda x: x.maxsim_score, reverse=True)
     result = scored[:top_k]
-    log.info("retrieval.done", returned=len(result), pass_label=pass_label,
-             top_score=result[0].maxsim_score if result else None)
+    log.info("retrieval.rerank_done", reranked=len(scored), returned=len(result),
+             elapsed=round(time.monotonic() - rerank_t0, 3), pass_label=pass_label)
+    log.info("retrieval.done", returned=len(result),
+             top_score=result[0].maxsim_score if result else None,
+             total_elapsed=round(time.monotonic() - total_t0, 3), pass_label=pass_label)
     return result

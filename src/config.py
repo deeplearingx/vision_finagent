@@ -30,7 +30,21 @@ class Settings(BaseSettings):
 
     REQUIRE_RETRIEVAL_GPU: bool = False  # False = allow CPU fallback; True = fail if no CUDA placement
 
-    MAX_BATCH_SIZE: int = 4
+    # Upload limits
+    MAX_UPLOAD_BYTES: int = 300 * 1024 * 1024   # 300MB
+    UPLOAD_CHUNK_SIZE: int = 1024 * 1024        # 1MB
+
+    # PDF limits
+    MAX_PDF_PAGES: int = 1200
+    PDF_RENDER_DPI: int = 150
+    MAX_RENDERED_PAGE_PIXELS: int = 8_000_000
+
+    # Page image storage
+    PAGE_IMAGE_DIR: str = str(PROJECT_ROOT / "data" / "page_images")
+    PAGE_THUMB_MAX_SIDE: int = 512
+    PAGE_THUMB_B64_LIMIT: int = 64000
+
+    MAX_BATCH_SIZE: int = 2
     LOG_LEVEL: str = "INFO"
     IDEMPOTENCY_TTL: int = 86400  # seconds
     # VLM_TIMEOUT: OpenAI client 级别超时（连接+响应），应 >= VLM_QUERY_TIMEOUT
@@ -38,10 +52,7 @@ class Settings(BaseSettings):
     # VLM_QUERY_TIMEOUT: asyncio.wait_for 层超时，必须 < VLM_TIMEOUT 才有意义
     VLM_QUERY_TIMEOUT: int = 90
     # MAX_VLM_IMAGES: images sent to VLM per query.
-    # Must match frontend default top_k (currently 5) so retrieved pages are
-    # not silently truncated before VLM sees them.  If you change the frontend
-    # default, update this value in sync.
-    MAX_VLM_IMAGES: int = 5        # aligned with frontend default top_k=5
+    MAX_VLM_IMAGES: int = 10
 
     # Second-pass VLM evidence expansion (conservative two-round mode)
     VLM_SECOND_PASS_ENABLED: bool = True
@@ -50,8 +61,8 @@ class Settings(BaseSettings):
     VLM_SECOND_PASS_MAX_IMAGES: int = 10  # max images sent to VLM in second pass
 
     # VLM outbound image compression (applied only before sending to VLM, not stored)
-    VLM_IMG_MAX_SIDE: int = 1024   # resize longest side to this (pixels); 0 = no resize
-    VLM_IMG_JPEG_QUALITY: int = 75 # JPEG re-encode quality 1-95; 0 = skip re-encode
+    VLM_IMG_MAX_SIDE: int = 1536   # resize longest side to this (pixels); 0 = no resize
+    VLM_IMG_JPEG_QUALITY: int = 85 # JPEG re-encode quality 1-95; 0 = skip re-encode
     VLM_IMG_MAX_BYTES: int = 0     # hard byte budget per image (0 = disabled)
 
     # VLM connection-level retry (only for transient network errors, not timeouts/empty responses)
@@ -59,9 +70,16 @@ class Settings(BaseSettings):
     VLM_RETRY_MAX_ATTEMPTS: int = 2   # total attempts (1 original + 1 retry)
     VLM_RETRY_BACKOFF_SECONDS: float = 1.0  # sleep between attempts
 
-    INGEST_TIMEOUT: int = 300      # seconds for ingestion task
-    INGEST_WORKERS: int = 2        # background thread pool for ingestion
-    QUERY_TIMEOUT: int = 60        # seconds for retrieval API call
+    INGEST_TIMEOUT: int = 7200     # seconds for ingestion task
+    INGEST_WORKERS: int = 1        # background thread pool for ingestion
+    QUERY_TIMEOUT: int = 180       # seconds for retrieval API call
+
+    # Multi-query-vector retrieval
+    RETRIEVAL_USE_MEAN_POOL_ANN: bool = False  # True=旧 mean-pool 单向量, False=多向量召回
+    RETRIEVAL_MAX_QUERY_VECS: int = 8          # 采样 query token 数量上限（保守起步）
+    RETRIEVAL_PER_VEC_LIMIT: int = 10          # 每个 query vector 的 ANN top-N
+    RETRIEVAL_MAX_CANDIDATE_PAGES: int = 80    # ANN 后候选页截断上限
+    RETRIEVAL_RERANK_PAGE_CAP: int = 50        # MaxSim 前候选页截断上限
 
     def validate_model_paths(self) -> None:
         """Fail fast if MODEL_PATH is a LoRA adapter dir but BASE_MODEL_PATH is not set."""

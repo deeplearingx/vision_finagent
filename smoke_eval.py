@@ -101,11 +101,11 @@ def run_eval(
             "use_retrieval": True,
             "refresh_retrieval": refresh_retrieval,
             "top_k": 5,
-            "candidate_k": 50,
+            "candidate_k": 80,
         }
 
         try:
-            resp = requests.post(api_url, json=payload, timeout=120)
+            resp = requests.post(api_url, json=payload, timeout=600)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:

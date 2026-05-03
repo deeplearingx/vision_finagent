@@ -65,10 +65,18 @@ class QueryRequest(BaseModel):
     target_companies: list[str] = []
     report_ids: list[str] = []
     top_k: int = 5
-    candidate_k: int = 50
+    candidate_k: int = 80
     session_id: str | None = None
     use_retrieval: bool = True
     refresh_retrieval: bool = False
+
+
+async def _cleanup_upload_failure(tmp_path: str, token: str) -> None:
+    try:
+        os.unlink(tmp_path)
+    except Exception:
+        pass
+    await _release_idem(token)
 
 
 @router.post("/upload", status_code=202)
@@ -84,28 +92,51 @@ async def upload_report(
     if not await check_and_set(token):
         raise HTTPException(409, "Duplicate upload")
 
-    data = await file.read()
-
     suffix = os.path.splitext(file.filename or "")[1].lower() or ".pdf"
     if suffix not in _ALLOWED_EXTS:
+        await _release_idem(token)
         raise HTTPException(400, f"Unsupported file type: {suffix}. Allowed: {', '.join(_ALLOWED_EXTS)}")
 
-    if suffix == ".pdf":
-        if not _is_valid_pdf(data):
-            raise HTTPException(400, "Invalid PDF: missing %PDF header or %%EOF marker")
-    else:
-        if not _is_valid_image(data, suffix):
-            raise HTTPException(400, f"Invalid image: magic bytes do not match {suffix}")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = tmp.name
+    total_bytes = 0
+    header_bytes = b""
+    try:
+        while True:
+            chunk = await file.read(settings.UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > settings.MAX_UPLOAD_BYTES:
+                tmp.close()
+                await _cleanup_upload_failure(tmp_path, token)
+                raise HTTPException(413, f"文件超过大小限制 {settings.MAX_UPLOAD_BYTES // (1024*1024)}MB")
+            if len(header_bytes) < 16:
+                header_bytes += chunk
+            tmp.write(chunk)
+        tmp.close()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        tmp.close()
+        await _cleanup_upload_failure(tmp_path, token)
+        raise HTTPException(500, f"上传写入失败：{exc}")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
+    if suffix == ".pdf":
+        if header_bytes[:4] != b"%PDF":
+            await _cleanup_upload_failure(tmp_path, token)
+            raise HTTPException(400, "Invalid PDF: missing %PDF header")
+    else:
+        if not _is_valid_image(header_bytes, suffix):
+            await _cleanup_upload_failure(tmp_path, token)
+            raise HTTPException(400, f"Invalid image: magic bytes do not match {suffix}")
 
     task_id = await submit_ingest_task(report_id, tmp_path)
     return {
         "report_id": report_id,
         "task_id": task_id,
         "status": ReportStatus.PENDING,
+        "file_size_bytes": total_bytes,
     }
 
 

@@ -9,7 +9,7 @@ _log = logging.getLogger(__name__)
 
 # Expected field sets per collection (field_name -> DataType name)
 _PATCHES_EXPECTED_FIELDS = {"pk", "report_id", "page_num", "colpali_embeddings"}
-_PAGES_EXPECTED_FIELDS = {"page_id", "report_id", "page_num", "image_base64", "_vec"}
+_PAGES_EXPECTED_FIELDS = {"page_id", "report_id", "page_num", "image_base64", "image_path", "_vec"}
 
 
 def get_client() -> MilvusClient:
@@ -130,6 +130,7 @@ def _ensure_pages_collection(client: MilvusClient, name: str) -> None:
     schema.add_field("report_id", DataType.VARCHAR, max_length=128)
     schema.add_field("page_num", DataType.INT64)
     schema.add_field("image_base64", DataType.JSON)
+    schema.add_field("image_path", DataType.VARCHAR, max_length=1024)
     schema.add_field("_vec", DataType.FLOAT_VECTOR, dim=2)  # required by Zilliz Cloud (min dim=2)
 
     index_params = client.prepare_index_params()
