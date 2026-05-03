@@ -471,14 +471,21 @@
       return `<div class="degrade-banner rounded-lg px-3 py-2 text-xs text-red-300 mt-2">⚠ ${escHtml(text)}</div>`;
     }
 
-    function buildEvidenceHtml(evidence, pages) {
+    function buildEvidenceHtml(evidence, pages, imageFetchIncomplete) {
       if (!evidence || !evidence.length) return '';
       const id = `evd-${Math.random().toString(36).slice(2)}`;
       const rows = evidence.map((item, idx) => {
         const page = pages?.[idx] || {};
-        const img = page.image_base64
-          ? `<img src="data:image/png;base64,${page.image_base64}" class="w-full rounded border border-[#334155] mt-2" alt="页面预览" loading="lazy">`
-          : '<div class="mt-2 text-[11px] text-slate-500">历史会话恢复时仅保留证据摘要，本次未附带页面图像。</div>';
+        let img;
+        if (page.image_base64) {
+          img = `<img src="data:image/png;base64,${page.image_base64}" class="w-full rounded border border-[#334155] mt-2" alt="页面预览" loading="lazy">`;
+        } else if (imageFetchIncomplete) {
+          img = '<div class="mt-2 text-[11px] text-slate-500">图片加载失败，Milvus 中该页面暂无图像数据。</div>';
+        } else if (pages && pages.length) {
+          img = '<div class="mt-2 text-[11px] text-slate-500">该页面暂无图像。</div>';
+        } else {
+          img = '<div class="mt-2 text-[11px] text-slate-500">历史会话恢复时仅保留证据摘要，本次未附带页面图像。</div>';
+        }
         return `
           <div class="bg-[#1E293B] rounded-lg p-3 border border-[#334155]">
             <div class="flex items-center justify-between mb-1 gap-2">
@@ -507,11 +514,11 @@
       return '';
     }
 
-    function appendBotMsg({ answerHtml, degraded = false, degradeReason = 'none', evidence = [], pages = [], evidenceSource = null, updateEvidence = false }) {
+    function appendBotMsg({ answerHtml, degraded = false, degradeReason = 'none', evidence = [], pages = [], evidenceSource = null, updateEvidence = false, imageFetchIncomplete = false }) {
       const wrap = document.getElementById('chat-messages');
       const d = document.createElement('div');
       d.className = 'flex gap-3';
-      d.innerHTML = `${botAvatar()}<div class="msg-bot px-4 py-3 text-sm text-slate-200 max-w-3xl">${answerHtml}${buildSourceBadge(evidenceSource)}${buildDegradeBanner(degraded, degradeReason)}${buildEvidenceHtml(evidence, pages)}</div>`;
+      d.innerHTML = `${botAvatar()}<div class="msg-bot px-4 py-3 text-sm text-slate-200 max-w-3xl">${answerHtml}${buildSourceBadge(evidenceSource)}${buildDegradeBanner(degraded, degradeReason)}${buildEvidenceHtml(evidence, pages, imageFetchIncomplete)}</div>`;
       wrap.appendChild(d);
       wrap.scrollTop = wrap.scrollHeight;
       if (updateEvidence && evidence && evidence.length) {
@@ -800,6 +807,7 @@
       let currentDegradeReason = 'none';
       let currentSessionId = sessionId;
       let currentPages = [];
+      let currentImageFetchIncomplete = false;
 
       try {
         const body = {
@@ -871,12 +879,18 @@
                 const ev = JSON.parse(dataStr);
                 if (ev.evidence) {
                   currentEvidence = ev.evidence;
-                  currentPages = ev.evidence.map((e) => ({
-                    report_id: e.report_id,
-                    page_num: e.page_num,
-                    image_base64: '',
-                    maxsim_score: e.maxsim_score,
-                  }));
+                  // Use retrieved_pages (with image_base64) when available; fall back to evidence-only
+                  if (ev.retrieved_pages && ev.retrieved_pages.length) {
+                    currentPages = ev.retrieved_pages;
+                  } else {
+                    currentPages = ev.evidence.map((e) => ({
+                      report_id: e.report_id,
+                      page_num: e.page_num,
+                      image_base64: '',
+                      maxsim_score: e.maxsim_score,
+                    }));
+                  }
+                  currentImageFetchIncomplete = Boolean(ev.image_fetch_incomplete);
                 }
               } catch {}
             } else if (eventName === 'content') {
@@ -897,11 +911,14 @@
                 currentDegraded = doneData.degraded;
                 currentDegradeReason = doneData.degrade_reason || 'none';
                 currentEvidenceSource = doneData.evidence_source || null;
+                if (doneData.image_fetch_incomplete !== undefined) {
+                  currentImageFetchIncomplete = Boolean(doneData.image_fetch_incomplete);
+                }
               } catch {}
               if (!currentAnswer) {
                 answerEl.innerHTML = '<span class="text-slate-400">（无回答内容）</span>';
               }
-              metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
+              metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages, currentImageFetchIncomplete);
               if (currentEvidence && currentEvidence.length) {
                 updateEvidenceStatus(true);
               }
@@ -911,13 +928,13 @@
                 currentAnswer = `错误：${errData.message || errData.code || '未知错误'}`;
                 answerEl.innerHTML = `<span class="text-red-400">${escHtml(currentAnswer)}</span>`;
               } catch {}
-              metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
+              metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages, currentImageFetchIncomplete);
             }
           }
         }
 
         if (!metaEl.innerHTML) {
-          metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages);
+          metaEl.innerHTML = buildSourceBadge(currentEvidenceSource) + buildDegradeBanner(currentDegraded, currentDegradeReason) + buildEvidenceHtml(currentEvidence, currentPages, currentImageFetchIncomplete);
         }
 
         if (currentSessionId) {

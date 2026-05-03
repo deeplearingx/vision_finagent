@@ -529,12 +529,135 @@ class TestIdempotency(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Stream image regression tests
+# ---------------------------------------------------------------------------
+class TestStreamImage(BaseCase):
+    """Regression: SSE evidence event carries retrieved_pages with image_base64."""
+
+    def _stream_events(self, use_retrieval=True, session_id=None, question="test?"):
+        body = {"question": question, "use_retrieval": use_retrieval}
+        if session_id:
+            body["session_id"] = session_id
+        events = []
+        with self.client.stream("POST", "/reports/query/stream", json=body) as resp:
+            event_name = "message"
+            for line in resp.iter_lines():
+                if line.startswith("event:"):
+                    event_name = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line[len("data:"):].strip())
+                    events.append((event_name, data))
+                    event_name = "message"
+        return events
+
+    def _seed_cache(self, sid, evidence=None):
+        if evidence is None:
+            evidence = [{"report_id": "rpt1", "page_num": 1, "maxsim_score": 0.9}]
+        payload = json.dumps({"cached_at": "2026-01-01T00:00:00+00:00", "evidence": evidence})
+        asyncio.get_event_loop().run_until_complete(
+            self.redis.set(f"session:{sid}:evidence", payload)
+        )
+
+    def test_stream_first_query_evidence_has_images(self):
+        """First query: evidence event must carry retrieved_pages with image_base64."""
+        from src.models.schema import PageResult
+
+        pages = [PageResult(report_id="rpt1", page_num=1, image_base64="base64img==", maxsim_score=0.9)]
+
+        async def _fake_stream(q, p):
+            yield "答案"
+
+        with patch("src.routers.reports.retrieve", return_value=pages), \
+             patch("src.routers.reports.stream_generate_answer", side_effect=_fake_stream):
+            events = self._stream_events(session_id="si_first")
+
+        ev_events = [d for e, d in events if e == "evidence"]
+        self.assertTrue(ev_events, "No evidence event emitted")
+        first = ev_events[0]
+        self.assertIn("retrieved_pages", first)
+        self.assertEqual(len(first["retrieved_pages"]), 1)
+        self.assertEqual(first["retrieved_pages"][0]["image_base64"], "base64img==")
+        self.assertFalse(first["image_fetch_incomplete"])
+
+    def test_stream_first_query_done_image_fetch_incomplete_false(self):
+        """done event must have image_fetch_incomplete=False on fresh retrieval."""
+        from src.models.schema import PageResult
+
+        pages = [PageResult(report_id="rpt1", page_num=1, image_base64="img==", maxsim_score=0.9)]
+
+        async def _fake_stream(q, p):
+            yield "答案"
+
+        with patch("src.routers.reports.retrieve", return_value=pages), \
+             patch("src.routers.reports.stream_generate_answer", side_effect=_fake_stream):
+            events = self._stream_events(session_id="si_done")
+
+        done = next((d for e, d in events if e == "done"), None)
+        self.assertIsNotNone(done)
+        self.assertFalse(done["image_fetch_incomplete"])
+
+    def test_stream_cache_reuse_evidence_has_pages(self):
+        """Cache reuse: evidence event has retrieved_pages from Milvus."""
+        sid = "si_cache"
+        self._seed_cache(sid)
+        self.mock_milvus.query.return_value = [
+            {"report_id": "rpt1", "page_num": 1, "image_base64": "cached_img=="}
+        ]
+
+        async def _fake_stream(q, p):
+            yield "缓存答案"
+
+        with patch("src.routers.reports.stream_generate_answer", side_effect=_fake_stream):
+            events = self._stream_events(use_retrieval=False, session_id=sid)
+
+        ev_events = [d for e, d in events if e == "evidence"]
+        self.assertTrue(ev_events)
+        rp = ev_events[0].get("retrieved_pages", [])
+        self.assertEqual(len(rp), 1)
+        self.assertEqual(rp[0]["image_base64"], "cached_img==")
+        self.mock_milvus.query.return_value = []  # reset
+
+    def test_stream_cache_reuse_milvus_fail_image_fetch_incomplete(self):
+        """Cache reuse + Milvus failure → image_fetch_incomplete=True in evidence event."""
+        sid = "si_cache_fail"
+        self._seed_cache(sid)
+        self.mock_milvus.query.side_effect = RuntimeError("milvus down")
+
+        async def _fake_stream(q, p):
+            yield "答案"
+
+        with patch("src.routers.reports.stream_generate_answer", side_effect=_fake_stream):
+            events = self._stream_events(use_retrieval=False, session_id=sid)
+
+        ev_events = [d for e, d in events if e == "evidence"]
+        self.assertTrue(ev_events)
+        self.assertTrue(ev_events[0]["image_fetch_incomplete"])
+        self.mock_milvus.query.side_effect = None  # reset
+
+    def test_sync_retrieved_pages_has_image_base64(self):
+        """Sync path not regressed: retrieved_pages still present with image_base64."""
+        from src.models.schema import PageResult
+        from src.models.enums import DegradeReason
+
+        pages = [PageResult(report_id="rpt1", page_num=1, image_base64="base64img==", maxsim_score=0.9)]
+        with patch("src.routers.reports.retrieve", return_value=pages), \
+             patch("src.routers.reports.generate_answer",
+                   new_callable=AsyncMock, return_value=("答案", DegradeReason.NONE)):
+            r = self.client.post("/reports/query", json={"question": "test?", "use_retrieval": True,
+                                                          "session_id": "sync_img"})
+        body = r.json()
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("retrieved_pages", body)
+        self.assertEqual(body["retrieved_pages"][0]["image_base64"], "base64img==")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for cls in [TestUpload, TestQuery, TestSessions, TestMilvusSchema, TestIdempotency]:
+    for cls in [TestUpload, TestQuery, TestSessions, TestMilvusSchema, TestIdempotency, TestStreamImage]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

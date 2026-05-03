@@ -808,8 +808,8 @@ async def query_report_stream(req: QueryRequest):
                 for p in pages
             ]
 
-            # --- evidence event ---
-            yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence]})}\n\n"
+            # --- evidence event (include image_base64 so frontend can render pages) ---
+            yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence], 'retrieved_pages': [{'report_id': p.report_id, 'page_num': p.page_num, 'maxsim_score': p.maxsim_score, 'image_base64': p.image_base64} for p in pages], 'image_fetch_incomplete': image_fetch_incomplete})}\n\n"
 
             if not degraded and pages:
                 # cached_fallback: notify user before streaming answer
@@ -886,12 +886,12 @@ async def query_report_stream(req: QueryRequest):
 
                     if pages2:
                         pages2_capped = pages2[: settings.VLM_SECOND_PASS_MAX_IMAGES]
-                        # New evidence
+                        # New evidence (second pass — include images)
                         evidence = [
                             EvidenceSummary(report_id=p.report_id, page_num=p.page_num, maxsim_score=p.maxsim_score)
                             for p in pages2
                         ]
-                        yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence]})}\n\n"
+                        yield f"event: evidence\ndata: {json.dumps({'evidence': [e.model_dump() for e in evidence], 'retrieved_pages': [{'report_id': p.report_id, 'page_num': p.page_num, 'maxsim_score': p.maxsim_score, 'image_base64': p.image_base64} for p in pages2], 'image_fetch_incomplete': False})}\n\n"
 
                         second_pass_answer = ""
                         try:
