@@ -14,6 +14,30 @@ from pathlib import Path
 import requests
 
 # ---------------------------------------------------------------------------
+# 公司名 → report_id 映射（独立实现，不依赖 FastAPI 导入）
+# ---------------------------------------------------------------------------
+
+_COMPANY_REPORT_ALIASES = {
+    "jpmorganchase": "jpm_2024", "jpmorgan chase": "jpm_2024",
+    "jpmorgan": "jpm_2024", "jpm": "jpm_2024",
+    "citigroup": "citi_2024", "citi": "citi_2024",
+    "goldman sachs": "gs_2024", "goldman": "gs_2024", "gs": "gs_2024",
+    "morgan stanley": "ms_2024", "ms": "ms_2024",
+    "bank of america": "boa_2024", "bofa": "boa_2024", "boa": "boa_2024", "bac": "boa_2024",
+    "wells fargo": "wf_2024", "wf": "wf_2024",
+}
+
+
+def _infer_report_ids(question: str) -> list[str]:
+    q = question.lower()
+    matched = []
+    for alias, rid in _COMPANY_REPORT_ALIASES.items():
+        if alias in q and rid not in matched:
+            matched.append(rid)
+    return matched
+
+
+# ---------------------------------------------------------------------------
 # 自动评分
 # ---------------------------------------------------------------------------
 
@@ -95,13 +119,15 @@ def run_eval(
         query_types = item.get("query_types", [])
 
         session_id = f"smokeeval-q{qid}-{uuid.uuid4().hex[:6]}"
+        report_ids = _infer_report_ids(question)
         payload = {
             "question": question,
             "session_id": session_id,
             "use_retrieval": True,
             "refresh_retrieval": refresh_retrieval,
-            "top_k": 5,
-            "candidate_k": 80,
+            "top_k": 10,
+            "candidate_k": 300,
+            "report_ids": report_ids,
         }
 
         try:
@@ -142,6 +168,7 @@ def run_eval(
                 for e in data.get("evidence", [])
             ],
             "vlm_passes": data.get("vlm_passes"),
+            "inferred_report_ids": report_ids,
             "passed": passed,
             "score_reason": reason,
         })

@@ -26,6 +26,7 @@ class PageResult(BaseModel):
     page_num: int
     image_base64: str
     maxsim_score: float
+    page_text: str = ""
 
 
 class AuditLog(BaseModel):

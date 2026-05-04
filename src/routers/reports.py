@@ -100,8 +100,8 @@ class QueryRequest(BaseModel):
     question: str
     target_companies: list[str] = []
     report_ids: list[str] = []
-    top_k: int = 5
-    candidate_k: int = 80
+    top_k: int = 10
+    candidate_k: int = 300
     session_id: str | None = None
     use_retrieval: bool = True
     refresh_retrieval: bool = False

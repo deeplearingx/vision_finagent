@@ -170,6 +170,8 @@ def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
     total_orig, total_comp, img_count = 0, 0, 0
 
     for p in pages[: settings.MAX_VLM_IMAGES]:
+        _page_text_snippet = p.page_text[:2000] if p.page_text else ""
+        _text_section = f"\npage_text:\n{_page_text_snippet}\n" if _page_text_snippet else ""
         user_content.append({
             "type": "text",
             "text": (
@@ -177,6 +179,7 @@ def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
                 f"report_id: {p.report_id}\n"
                 f"page_num: {p.page_num}\n"
                 f"retrieval_score: {p.maxsim_score:.4f}\n"
+                f"{_text_section}"
             ),
         })
 

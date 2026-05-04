@@ -32,7 +32,10 @@ def _repair_pdf_with_pymupdf(path: str) -> str:
 
 
 def _iter_pdf_pages(path: str, dpi: int = 150):
-    """按页渲染 PDF，保留原始 page_num（1-based）。坏页跳过并记录日志。"""
+    """按页渲染 PDF，保留原始 page_num（1-based）。坏页跳过并记录日志。
+
+    Yields (page_num, img, page_text) 三元组。
+    """
     doc = None
     try:
         doc = fitz.open(path)
@@ -51,8 +54,11 @@ def _iter_pdf_pages(path: str, dpi: int = 150):
                 if pixels > settings.MAX_RENDERED_PAGE_PIXELS:
                     raise IngestionError(f"页面像素过大：page={page_num}, {pix.width}x{pix.height}={pixels}, limit={settings.MAX_RENDERED_PAGE_PIXELS}")
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                page_text = page.get_text("text") or ""
+                if len(page_text) > 32000:
+                    page_text = page_text[:32000]
                 ok_pages += 1
-                yield page_num, img
+                yield page_num, img, page_text
             except Exception as exc:
                 log.warning("pdf.bad_page", path=path, page_num=page_num, error=str(exc))
                 bad_pages.append(page_num)
@@ -84,10 +90,10 @@ def _load_images(paths: List[str]) -> List[Image.Image]:
 
 def _process_batch(
     report_id: str,
-    page_items: List[tuple],
+    page_items: List[tuple],  # now (page_num, Image, page_text)
 ) -> tuple[list, list[str]]:
-    """编码一批 (page_num, Image) 并写入 Milvus。"""
-    images = [img for _, img in page_items]
+    """编码一批 (page_num, Image, page_text) 并写入 Milvus。"""
+    images = [img for _, img, _ in page_items]
     model, processor = retrieval_service._load_model()
     batch_tensor = processor.process_images(images).to(model.device)
     with torch.no_grad():
@@ -101,7 +107,7 @@ def _process_batch(
     inserted_page_ids: list[str] = []
 
     for i, emb in enumerate(embeddings):
-        page_num, image = page_items[i]
+        page_num, image, page_text = page_items[i]
         page_id = f"{report_id}_{page_num}"
 
         rows = [
@@ -119,6 +125,7 @@ def _process_batch(
             "page_num": page_num,
             "image_base64": thumb_b64,
             "image_path": image_path,
+            "page_text": page_text,
             "_vec": [0.0, 0.0],
         }])
         inserted_page_ids.append(page_id)
@@ -149,8 +156,8 @@ async def ingest_report(report_id: str, image_paths: List[str]) -> None:
                     all_pks: list = []
                     all_pids: list[str] = []
                     try:
-                        for page_num, image in _iter_pdf_pages(repaired):
-                            batch.append((page_num, image))
+                        for page_num, image, page_text in _iter_pdf_pages(repaired):
+                            batch.append((page_num, image, page_text))
                             if len(batch) >= settings.MAX_BATCH_SIZE:
                                 pks, pids = _process_batch(report_id, batch)
                                 all_pks.extend(pks)
@@ -173,7 +180,7 @@ async def ingest_report(report_id: str, image_paths: List[str]) -> None:
                 inserted_page_ids.extend(pids)
             else:
                 images = await asyncio.to_thread(_load_images, [path])
-                page_items = [(1, images[0])]
+                page_items = [(1, images[0], "")]
                 pks, pids = await asyncio.to_thread(_process_batch, report_id, page_items)
                 inserted_patch_pks.extend(pks)
                 inserted_page_ids.extend(pids)

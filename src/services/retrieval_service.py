@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import structlog
 from typing import List
@@ -390,21 +391,29 @@ def retrieve(
             continue
         pages_vecs.setdefault(key, []).append(row["colpali_embeddings"])
 
-    # Stage 2b: fetch page metadata
+    # Stage 2b: fetch page metadata (batched to avoid gRPC 4MB limit)
     t3 = time.monotonic()
     page_ids = [f"{r}_{p}" for r, p in pages_vecs]
-    meta_rows = client.query(
-        collection_name=get_pages_collection_name(),
-        filter=f"page_id in {json.dumps(page_ids)}",
-        output_fields=["report_id", "page_num", "image_base64", "image_path"],
-        limit=len(page_ids) + 1,
-    )
+    _META_BATCH_SIZE = 30  # each page ~40KB base64; 30 pages ≈ 1.2MB < 4MB limit
+    meta_rows: list = []
+    for i in range(0, len(page_ids), _META_BATCH_SIZE):
+        batch_ids = page_ids[i : i + _META_BATCH_SIZE]
+        batch_rows = client.query(
+            collection_name=get_pages_collection_name(),
+            filter=f"page_id in {json.dumps(batch_ids)}",
+            output_fields=["report_id", "page_num", "image_base64", "image_path", "page_text"],
+            limit=len(batch_ids) + 1,
+        )
+        meta_rows.extend(batch_rows)
     log.info("retrieval.timing", stage="page_meta_query",
+             pages_queried=len(page_ids), batches=(len(page_ids) + _META_BATCH_SIZE - 1) // _META_BATCH_SIZE,
              elapsed=round(time.monotonic() - t3, 3), pass_label=pass_label)
 
     page_meta: dict[tuple[str, int], str] = {}
+    page_texts: dict[tuple[str, int], str] = {}
     for r in meta_rows:
         key = (r["report_id"], r["page_num"])
+        page_texts[key] = r.get("page_text", "")
         image_path = r.get("image_path")
         if image_path:
             try:
@@ -424,9 +433,69 @@ def retrieve(
         b64 = page_meta.get((rid, pnum), "")
         page_vecs = np.array(vecs, dtype=np.float32)
         score = _maxsim_score(q_vecs, page_vecs)
-        scored.append(PageResult(report_id=rid, page_num=pnum, image_base64=b64, maxsim_score=score))
+        scored.append(PageResult(report_id=rid, page_num=pnum, image_base64=b64, maxsim_score=score, page_text=page_texts.get((rid, pnum), "")))
 
     scored.sort(key=lambda x: x.maxsim_score, reverse=True)
+
+    # Stage 3b: Keyword-weighted re-rank (conservative boost)
+    # Only boost pages already in the visual candidate set — do NOT pull in
+    # new pages from keyword matching alone, as that introduces noise.
+    # Visual rank weight is 3x keyword rank weight to preserve ColPali signal.
+    query_tokens = set(re.findall(r'[a-zA-Z0-9]+', query.lower()))
+    _STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+                   "have", "has", "had", "do", "does", "did", "will", "would", "could",
+                   "should", "may", "might", "shall", "can", "need", "dare", "ought",
+                   "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
+                   "as", "into", "through", "during", "before", "after", "above", "below",
+                   "between", "out", "off", "over", "under", "again", "further", "then",
+                   "once", "what", "which", "who", "whom", "this", "that", "these", "those",
+                   "and", "but", "or", "nor", "not", "so", "yet", "both", "either", "neither",
+                   "each", "every", "all", "any", "few", "more", "most", "other", "some",
+                   "such", "no", "only", "own", "same", "than", "too", "very", "just",
+                   "how", "where", "when", "while", "about", "against", "it", "its"}
+    query_keywords = {t for t in query_tokens if len(t) >= 3 and t not in _STOP_WORDS}
+
+    if query_keywords and page_texts:
+        # Compute keyword hit count per page (only for pages already in scored list)
+        keyword_scores: dict[tuple[str, int], int] = {}
+        for s in scored:
+            key = (s.report_id, s.page_num)
+            text = page_texts.get(key, "")
+            if not text:
+                continue
+            text_lower = text.lower()
+            hits = sum(1 for kw in query_keywords if kw in text_lower)
+            if hits > 0:
+                keyword_scores[key] = hits
+
+        if keyword_scores:
+            # Rank by keyword hits (descending) among visual candidates only
+            keyword_ranked = sorted(keyword_scores.items(), key=lambda x: x[1], reverse=True)
+            keyword_rank_map = {key: rank for rank, (key, _) in enumerate(keyword_ranked, 1)}
+
+            # Weighted RRF: visual weight=3, keyword weight=1
+            # Pages without keyword hits keep their original visual order
+            _RRF_K = 60
+            _VIS_WEIGHT = 3.0
+            _KW_WEIGHT = 1.0
+            n_scored = len(scored)
+            rrf_scores: dict[tuple[str, int], float] = {}
+            for i, s in enumerate(scored):
+                key = (s.report_id, s.page_num)
+                v_rank = i + 1
+                k_rank = keyword_rank_map.get(key, n_scored + 1)
+                rrf_scores[key] = _VIS_WEIGHT / (_RRF_K + v_rank) + _KW_WEIGHT / (_RRF_K + k_rank)
+
+            scored.sort(key=lambda s: rrf_scores.get((s.report_id, s.page_num), 0), reverse=True)
+            log.info("retrieval.keyword_boost", query_keywords=len(query_keywords),
+                     keyword_hits=len(keyword_scores), boost_applied=True, pass_label=pass_label)
+        else:
+            log.info("retrieval.keyword_boost", query_keywords=len(query_keywords),
+                     keyword_hits=0, boost_applied=False, pass_label=pass_label)
+    else:
+        log.info("retrieval.keyword_boost", query_keywords=len(query_keywords),
+                 boost_applied=False, pass_label=pass_label)
+
     result = scored[:top_k]
     log.info("retrieval.rerank_done", reranked=len(scored), returned=len(result),
              elapsed=round(time.monotonic() - rerank_t0, 3), pass_label=pass_label)
