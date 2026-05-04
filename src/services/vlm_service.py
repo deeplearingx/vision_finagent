@@ -65,11 +65,12 @@ INSUFFICIENT_EVIDENCE_PHRASE = "Insufficient evidence in provided pages"
 
 _FIN_DOC_SYSTEM = (
     "You are a financial document analyst. "
-    "Rules: "
-    "(1) IGNORE cover pages, table-of-contents pages, and disclaimer pages — do not extract data from them. "
-    "(2) Prioritize data tables, financial statements, and Management Discussion & Analysis sections. "
-    f"(3) If the provided pages do not contain sufficient evidence to answer the question, "
-    f"explicitly state '{INSUFFICIENT_EVIDENCE_PHRASE}' rather than guessing."
+    "Answer strictly from the provided evidence pages. "
+    "Ignore cover pages, table-of-contents pages, and disclaimer pages. "
+    "Prioritize financial statements, notes, tables, and MD&A sections. "
+    "For numerical answers, preserve exact value, unit, sign, year, and company. "
+    "Every factual answer must cite report_id and page_num. "
+    f"If evidence is insufficient, explicitly state '{INSUFFICIENT_EVIDENCE_PHRASE}'."
 )
 
 
@@ -145,17 +146,40 @@ _NO_EVIDENCE_NOTE = (
 def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
     """Build VLM message list with financial-document analysis instructions.
 
-    Structure: system instruction (text) → user query (text) → page images.
+    Structure: system instruction (system role) → user query + evidence pages (user role).
+    Each evidence page is preceded by a text block with report_id, page_num, and retrieval_score.
     When pages is empty, a text-only message is built with a no-evidence note.
     Applies outbound image compression per VLM_IMG_* settings before sending.
     """
     prefix = _NO_EVIDENCE_NOTE if not pages else ""
-    content: list[dict] = [
-        {"type": "text", "text": _FIN_DOC_SYSTEM},
-        {"type": "text", "text": prefix + query},
+
+    user_content: list[dict] = [
+        {
+            "type": "text",
+            "text": (
+                f"Question:\n{prefix + query}\n\n"
+                "Requirements:\n"
+                "1. Use only the provided evidence pages.\n"
+                "2. For numerical answers, preserve exact value, unit, year, and company.\n"
+                "3. Cite evidence using report_id and page_num.\n"
+                f"4. If evidence is insufficient, say exactly: {INSUFFICIENT_EVIDENCE_PHRASE}."
+            ),
+        }
     ]
+
     total_orig, total_comp, img_count = 0, 0, 0
+
     for p in pages[: settings.MAX_VLM_IMAGES]:
+        user_content.append({
+            "type": "text",
+            "text": (
+                f"[Evidence Page]\n"
+                f"report_id: {p.report_id}\n"
+                f"page_num: {p.page_num}\n"
+                f"retrieval_score: {p.maxsim_score:.4f}\n"
+            ),
+        })
+
         if p.image_base64:
             compressed_b64, orig_b, comp_b = _compress_image_base64(p.image_base64)
             total_orig += orig_b
@@ -168,10 +192,11 @@ def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
                 comp_bytes=comp_b,
                 ratio=round(comp_b / orig_b, 3) if orig_b else 1.0,
             )
-            content.append({
+            user_content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{compressed_b64}"},
             })
+
     log.info(
         "image_compress.summary",
         images=img_count,
@@ -180,7 +205,11 @@ def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
         saved_bytes=total_orig - total_comp,
         ratio=round(total_comp / total_orig, 3) if total_orig else 1.0,
     )
-    return [{"role": "user", "content": content}]
+
+    return [
+        {"role": "system", "content": _FIN_DOC_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
 
 
 # Keywords indicating a market/price-trend question.

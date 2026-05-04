@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, List
+import re
 
 from ..config import settings
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
@@ -26,12 +27,47 @@ from ..services.vlm_service import (
 from ..services.task_service import submit_ingest_task, get_task
 from ..core.redis_client import get_redis
 from ..core.milvus_client import clear_report_collections, list_reports_inventory, delete_report_data, delete_report_data_by_prefix
+from ..utils.image import encode_image_file_for_vlm
 
 # Redis key: session:{session_id}  TTL: 2 days
 _SESSION_TTL = 2 * 86400
 _SESSION_MAX_HISTORY = 40
 _SESSION_INDEX_KEY = "session_index"
 _SESSION_LIST_LIMIT = 50
+
+_COMPANY_REPORT_ALIASES = {
+    "jpmorganchase": "jpm_2024",
+    "jpmorgan chase": "jpm_2024",
+    "jpmorgan": "jpm_2024",
+    "jpm": "jpm_2024",
+    "citigroup": "citi_2024",
+    "citi": "citi_2024",
+    "goldman sachs": "gs_2024",
+    "goldman": "gs_2024",
+    "gs": "gs_2024",
+    "morgan stanley": "ms_2024",
+    "ms": "ms_2024",
+    "bank of america": "boa_2024",
+    "bofa": "boa_2024",
+    "boa": "boa_2024",
+    "bac": "boa_2024",
+    "wells fargo": "wf_2024",
+    "wf": "wf_2024",
+}
+
+
+def _normalize_company_text(s: str) -> str:
+    return re.sub(r"\s+", " ", s.lower().replace("-", " ")).strip()
+
+
+def _infer_report_ids_from_question(question: str) -> list[str]:
+    q = _normalize_company_text(question)
+    hits = []
+    for alias, report_id in _COMPANY_REPORT_ALIASES.items():
+        if alias in q:
+            hits.append(report_id)
+    return sorted(set(hits))
+
 
 router = APIRouter(prefix="/reports")
 
@@ -268,11 +304,22 @@ async def _build_pages_from_cache(
             lambda: _get_mc().query(
                 collection_name=_pages_col(),
                 filter=f"page_id in {json.dumps(page_ids)}",
-                output_fields=["report_id", "page_num", "image_base64"],
+                output_fields=["report_id", "page_num", "image_base64", "image_path"],
                 limit=len(page_ids) + 1,
             ),
         )
-        img_map = {(r["report_id"], r["page_num"]): r["image_base64"] for r in meta_rows}
+        img_map = {}
+        for r in meta_rows:
+            key = (r["report_id"], r["page_num"])
+            image_path = r.get("image_path")
+            if image_path:
+                try:
+                    img_map[key] = encode_image_file_for_vlm(image_path)
+                    continue
+                except Exception as exc:
+                    image_fetch_incomplete = True
+                    log.warning("cache_reuse_highres_image_failed", report_id=r["report_id"], page_num=r["page_num"], image_path=image_path, error=str(exc))
+            img_map[key] = r.get("image_base64", "")
         missing = [pid for pid in page_ids if not img_map.get(tuple(pid.rsplit("_", 1)))]
         # rebuild missing check properly
         missing = [
@@ -307,6 +354,43 @@ async def _build_pages_from_cache(
         for e in cached_evidence
     ]
     return pages, True, image_fetch_incomplete
+
+
+_NUMERIC_Q = re.compile(
+    r"20\d{2}|amount|revenue|income|asset|liabilit|equity|expense|"
+    r"profit|loss|repurchase|stock|share|dividend|fair value|"
+    r"what was|how much|多少|金额|收入|利润|资产|负债|权益|回购|股息",
+    re.IGNORECASE,
+)
+
+
+def _answer_has_number(answer: str | None) -> bool:
+    return bool(answer and re.search(r"\d", answer))
+
+
+def _answer_has_citation(answer: str | None) -> bool:
+    if not answer:
+        return False
+    a = answer.lower()
+    return "page" in a or "page_num" in a or "页" in answer
+
+
+def _low_score_margin(pages: list) -> bool:
+    if len(pages) < 5:
+        return False
+    return abs(pages[0].maxsim_score - pages[4].maxsim_score) < 1.0
+
+
+def should_trigger_second_pass(question: str, answer: str | None, pages: list) -> bool:
+    if is_insufficient_evidence(answer):
+        return True
+    if _NUMERIC_Q.search(question) and not _answer_has_number(answer):
+        return True
+    if pages and not _answer_has_citation(answer):
+        return True
+    if _low_score_margin(pages):
+        return True
+    return False
 
 
 async def _backfill_meta(session_id: str, score: float) -> dict:
@@ -519,6 +603,15 @@ async def query_report(req: QueryRequest):
     evidence_source = "new_retrieval"
     image_fetch_incomplete = False
 
+    effective_report_ids = req.report_ids or _infer_report_ids_from_question(req.question)
+    if effective_report_ids:
+        inventory = list_reports_inventory()
+        available = {r["report_id"] for r in inventory.get("reports", [])}
+        missing = [rid for rid in effective_report_ids if rid not in available]
+        if missing:
+            log.warning("query.report_id_missing", requested=effective_report_ids, missing=missing, available=sorted(available))
+            effective_report_ids = [rid for rid in effective_report_ids if rid in available]
+
     run_retrieval = req.use_retrieval or req.refresh_retrieval
     vlm_passes = 0
     second_pass_triggered = False
@@ -532,7 +625,7 @@ async def query_report(req: QueryRequest):
             pages = await asyncio.wait_for(
                 _loop.run_in_executor(
                     None,
-                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass", req.report_ids or None),
+                    lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass", effective_report_ids or None),
                 ),
                 timeout=settings.QUERY_TIMEOUT,
             )
@@ -608,7 +701,7 @@ async def query_report(req: QueryRequest):
         if (
             vlm_reason == DegradeReason.NONE
             and settings.VLM_SECOND_PASS_ENABLED
-            and is_insufficient_evidence(answer)
+            and should_trigger_second_pass(req.question, answer, pages)
         ):
             second_pass_triggered = True
             log.info(
@@ -629,7 +722,7 @@ async def query_report(req: QueryRequest):
                             settings.VLM_SECOND_PASS_TOP_K,
                             settings.VLM_SECOND_PASS_CANDIDATE_K,
                             "second_pass",
-                            req.report_ids or None,
+                            effective_report_ids or None,
                         ),
                     ),
                     timeout=settings.QUERY_TIMEOUT,
@@ -751,6 +844,15 @@ async def query_report_stream(req: QueryRequest):
         evidence_source = "new_retrieval"
         image_fetch_incomplete = False
 
+        effective_report_ids = req.report_ids or _infer_report_ids_from_question(req.question)
+        if effective_report_ids:
+            inventory = list_reports_inventory()
+            available = {r["report_id"] for r in inventory.get("reports", [])}
+            missing = [rid for rid in effective_report_ids if rid not in available]
+            if missing:
+                log.warning("query.report_id_missing", requested=effective_report_ids, missing=missing, available=sorted(available))
+                effective_report_ids = [rid for rid in effective_report_ids if rid in available]
+
         run_retrieval = req.use_retrieval or req.refresh_retrieval
         vlm_passes = 0
         second_pass_triggered = False
@@ -770,7 +872,7 @@ async def query_report_stream(req: QueryRequest):
                     pages = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass", req.report_ids or None),
+                            lambda: retrieve(req.question, req.target_companies, req.top_k, req.candidate_k, "first_pass", effective_report_ids or None),
                         ),
                         timeout=settings.QUERY_TIMEOUT,
                     )
@@ -884,7 +986,7 @@ async def query_report_stream(req: QueryRequest):
                 # Second pass
                 if (
                     settings.VLM_SECOND_PASS_ENABLED
-                    and is_insufficient_evidence(answer)
+                    and should_trigger_second_pass(req.question, answer, pages)
                 ):
                     second_pass_triggered = True
                     yield f"event: second_pass\ndata: {json.dumps({})}\n\n"
@@ -906,7 +1008,7 @@ async def query_report_stream(req: QueryRequest):
                                     settings.VLM_SECOND_PASS_TOP_K,
                                     settings.VLM_SECOND_PASS_CANDIDATE_K,
                                     "second_pass",
-                                    req.report_ids or None,
+                                    effective_report_ids or None,
                                 ),
                             ),
                             timeout=settings.QUERY_TIMEOUT,
