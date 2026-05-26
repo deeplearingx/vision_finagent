@@ -1,126 +1,144 @@
-# Vision-FinAgent
+# Vision FinAgent：多模态金融报告分析 Agent
 
-基于 ColPali + Milvus Lite + FastAPI 的多模态财报检索与对话系统，提供：
-
-- PDF 财报上传与异步向量化
-- 基于 ColPali MaxSim 的页面级检索
-- Web 对话界面
-- 会话历史保存接口
-- OpenAI 兼容私有 VLM 连通能力
+> 面向金融财报 / 年报场景的多模态 RAG 问答系统。系统支持 PDF / 图片上传、页面级解析、视觉向量建库、财报证据页召回、VLM 回答生成、多轮会话管理和 evidence 复用，目标是让用户能够基于原始财报页面进行可追溯的问答分析。
 
 ---
 
-## 当前运行形态
+## 面试官快速查看
 
-当前项目已经调整为 **单机 AutoDL 运行模式**，不再以 Docker Milvus standalone 为主路径，而是默认使用：
+### 项目定位
 
-- **Milvus Lite 本地文件模式**
-- **Redis** 用于幂等控制
-- **FastAPI + Uvicorn** 提供 API 与前端静态页面
-- **ColPali 本地模型目录** 做检索编码
+Vision FinAgent 不是普通文本 RAG，而是一个面向财报页面的 **多模态检索增强问答系统**。财报中的关键信息大量存在于表格、版式、图片和跨页结构中，因此项目采用 ColPali 对页面图像进行多向量表示，并通过 MaxSim 完成 query-page 相关性计算，最后把 evidence、page_num、maxsim_score 等证据信息返回给 VLM 和前端。
 
-默认前端页面由 FastAPI 直接挂载，访问根路径即可打开界面。
+### 核心能力
+
+- **多模态入库**：支持 PDF / 图片上传，完成页面渲染、文本抽取、图像编码、向量入库和任务状态查询。
+- **页面级证据召回**：基于 ColPali + Milvus 实现财报页面级检索，返回 evidence、page_num、maxsim_score 等结构化证据信息。
+- **VLM 证据问答**：将检索到的财报页面与证据上下文传入 VLM，生成基于原始页面的回答。
+- **多轮会话与证据复用**：基于 Redis 管理 session history 与 evidence cache，支持追问、刷新恢复和检索失败兜底。
+- **二次检索增强**：当首轮回答缺少数字、引用或证据不足时，扩大召回范围并重新生成回答，提升数值类金融问答稳定性。
+- **工程化部署**：基于 FastAPI 提供服务接口，支持健康检查、schema 检查、超时控制、降级回答和 GPU 加载校验。
+
+### 当前评测口径
+
+当前已构建 bank-class 财报问答冒烟评测集，用于验证多模态 RAG 主链路，包括数值查询、证据页召回与答案引用等场景。
+
+| 指标 | 含义 | 当前结果 |
+| --- | --- | --- |
+| Evidence Recall@5 | Top-5 召回页面中是否包含标注证据页 | 87.5% |
+| Answer Accuracy | 回答是否命中正确财报数值 / 结论 | 91.7% |
+
+> 说明：当前指标用于小规模冒烟验证和回归观察，不等价于大规模公开 benchmark。后续可继续扩展到更多公司、更多年份和更多问题类型。
 
 ---
 
-## 目录说明
+## 技术栈
+
+| 模块 | 技术 |
+| --- | --- |
+| Web 服务 | FastAPI, Uvicorn, Pydantic Settings |
+| 多模态检索 | ColPali, MaxSim, PyTorch, Transformers |
+| 向量数据库 | Milvus Lite / Zilliz Cloud / Milvus Standalone |
+| 会话与缓存 | Redis session history, evidence cache |
+| 文档处理 | PyMuPDF, PDF page rendering, text extraction |
+| 回答生成 | OpenAI-compatible VLM API |
+| 工程化 | health check, schema check, timeout, degraded fallback, GPU fail-fast |
+
+---
+
+## 系统架构
+
+```text
+User / Web UI
+    │
+    ▼
+FastAPI
+    ├── /reports/upload              # 文件上传与异步入库
+    ├── /reports/tasks/{task_id}      # 入库任务状态查询
+    ├── /reports/query                # 多模态检索问答
+    ├── /reports/sessions             # 会话列表
+    ├── /ready, /schema-health        # 健康检查与 schema 检查
+    │
+    ▼
+Ingestion Pipeline
+    ├── PDF / Image validation
+    ├── PyMuPDF page rendering
+    ├── page text extraction
+    ├── ColPali page embedding
+    └── Milvus page vector collection
+    │
+    ▼
+Query Pipeline
+    ├── query embedding
+    ├── MaxSim page retrieval
+    ├── evidence construction
+    ├── Redis evidence cache
+    ├── VLM answer generation
+    └── degraded fallback if timeout / failure
+```
+
+---
+
+## 核心流程
+
+### 1. 财报入库
+
+```text
+PDF / Image Upload
+→ 页面渲染与文本抽取
+→ ColPali 页面级视觉向量生成
+→ Milvus 写入页面向量、页码、报告 ID、图片路径和文本元数据
+→ 返回 task_id，前端轮询任务状态
+```
+
+### 2. 财报问答
+
+```text
+Question
+→ ColPali query encoding
+→ Milvus candidate retrieval
+→ MaxSim relevance scoring
+→ Top-K evidence page construction
+→ VLM answer generation
+→ 返回 answer + evidence + retrieved_pages + maxsim_score
+```
+
+### 3. 多轮追问
+
+```text
+session_id
+→ Redis 读取历史对话与上一轮 evidence
+→ 支持 use_retrieval=false 复用上一轮证据
+→ 支持证据不足时重新检索
+```
+
+---
+
+## 项目目录
 
 ```text
 vision_finagent/
 ├── src/
-│   ├── main.py                 # FastAPI 入口
-│   ├── config.py               # 配置项
-│   ├── routers/reports.py      # 上传/查询/会话历史接口
-│   ├── routers/health.py       # 健康检查接口
-│   ├── services/retrieval_service.py   # ColPali 检索逻辑
-│   ├── services/ingestion_service.py   # PDF 向量化入库
-│   └── core/milvus_client.py   # Milvus Lite / collection 管理
+│   ├── main.py                         # FastAPI 入口与 lifespan 初始化
+│   ├── config.py                       # 配置项与 fail-fast 校验
+│   ├── routers/
+│   │   ├── reports.py                  # 上传、查询、会话历史、管理接口
+│   │   └── health.py                   # 健康检查与 schema 检查
+│   ├── services/
+│   │   ├── ingestion_service.py        # PDF / 图片解析与向量化入库
+│   │   ├── retrieval_service.py        # ColPali + MaxSim 检索逻辑
+│   │   └── vlm_service.py              # VLM 回答生成与降级逻辑
+│   └── core/
+│       └── milvus_client.py            # Milvus collection 管理
 ├── static/
-│   └── index.html              # 前端对话 + 上传界面
-├── milvus_local.db             # Milvus Lite 本地数据库文件
+│   └── index.html                      # 简易上传与问答前端
+├── start.py                            # 推荐启动入口
 └── README.md
 ```
 
 ---
 
-## 环境要求
-
-- Python 3.10+
-- Redis
-- 可访问的本地 ColPali 模型目录
-- Linux / AutoDL 环境
-
----
-
-## 关键配置
-
-项目从 [`.env`](.env) 读取运行配置。常用项如下：
-
-### Milvus 连接模式
-
-**本地 Lite 模式（默认）**：不设置 `MILVUS_URI`，项目自动使用本地文件 `milvus_local.db`。
-
-**Zilliz Cloud 云端模式**：在 `.env` 中设置以下三项：
-
-```env
-MILVUS_URI=https://in03-xxxxxxxxxxxxxxxxx.serverless.gcp-us-west1.cloud.zilliz.com
-MILVUS_TOKEN=your_zilliz_api_token_here
-MILVUS_DB_NAME=default
-```
-
-- `MILVUS_URI`：Zilliz Cloud 控制台 → Cluster → Public Endpoint（保留 `https://`）
-- `MILVUS_TOKEN`：Zilliz Cloud 控制台 → API Keys → 生成或复制 token
-- `MILVUS_DB_NAME`：默认填 `default`；若创建了独立 database 则填对应名称
-- 切换到云端后，原本地 `milvus_local.db` 中的数据**不会自动迁移**，需重新上传 PDF
-
-**自建 Milvus Standalone（无认证）**：
-
-```env
-MILVUS_URI=http://your-host:19530
-# 不设置 MILVUS_TOKEN
-```
-
----
-
-```env
-MILVUS_COLLECTION=fin_vision_reports_v2
-REDIS_URL=redis://localhost:6379/0
-
-# MODEL_PATH 可为 LoRA adapter 目录或完整模型目录
-MODEL_PATH=/root/autodl-tmp/colpali-v1.2
-# 当 MODEL_PATH 是 LoRA adapter 目录时，必须设置 BASE_MODEL_PATH
-BASE_MODEL_PATH=/root/autodl-tmp/colpaligemma-3b-pt-448-base
-
-TRANSFORMERS_OFFLINE=1
-HF_DATASETS_OFFLINE=1
-
-VLM_API_BASE=https://ark.cn-beijing.volces.com/api/coding/v3
-VLM_MODEL=Kimi-K2.6
-VLM_API_KEY=your-key
-
-# OpenAI client 层超时
-VLM_TIMEOUT=120
-# query pipeline 层超时，必须小于 VLM_TIMEOUT
-VLM_QUERY_TIMEOUT=90
-INGEST_TIMEOUT=600
-QUERY_TIMEOUT=15
-
-# GPU 服务器默认强制检索模型驻留 GPU
-REQUIRE_RETRIEVAL_GPU=true
-```
-
-说明：
-
-- **不要**在 [`.env`](.env) 中设置 `MILVUS_URI=./milvus_local.db`
-- 本项目会通过 [`src/config.py`](src/config.py) 自动使用绝对路径形式的 Milvus Lite 文件
-- 当 [`MODEL_PATH`](src/config.py) 指向 **LoRA adapter 目录** 时，[`BASE_MODEL_PATH`](src/config.py) 必须指向 **完整 base model 目录**；当前版本已在 [`settings.validate_model_paths()`](src/config.py:43) 中做 fail-fast 校验
-- 当 [`MODEL_PATH`](src/config.py) 本身就是完整模型目录时，[`BASE_MODEL_PATH`](src/config.py) 可以留空
-- [`VLM_QUERY_TIMEOUT`](src/config.py:43) 必须小于 [`VLM_TIMEOUT`](src/config.py:43)，当前版本已在启动阶段做 fail-fast 校验，避免前端已超时但底层 VLM HTTP 连接仍长时间占用线程
-- 在 GPU 服务器上，默认会强制要求检索模型真正加载到 GPU；若未成功上 GPU，服务会直接启动失败，而不是静默退回 CPU
-
----
-
-## 启动方式
+## 快速启动
 
 ### 1. 启动 Redis
 
@@ -128,230 +146,78 @@ REQUIRE_RETRIEVAL_GPU=true
 redis-server --daemonize yes
 ```
 
-### 2. 启动服务
+### 2. 配置环境变量
 
-#### 推荐启动方式
+项目从 `.env` 读取配置。常用配置如下：
 
-当前项目统一使用 [`start.py`](start.py) 作为**标准启动入口**。它负责：
+```env
+MILVUS_COLLECTION=fin_vision_reports_v2
+REDIS_URL=redis://localhost:6379/0
 
-- 在导入 [`torch`](start.py:1) / [`uvicorn`](start.py:13) 之前执行兼容性保护
-- 通过 [`src.main:app`](src/main.py:69) 统一触发 [`lifespan()`](src/main.py:39) 启动流程
-- 在主线程内完成 [`warmup_retrieval_model()`](src/main.py:50)，确保检索模型、Redis、Milvus 都在启动阶段完成初始化
-- 固定监听 `0.0.0.0:8000`
+MODEL_PATH=/root/autodl-tmp/colpali-v1.2
+BASE_MODEL_PATH=/root/autodl-tmp/colpaligemma-3b-pt-448-base
 
-```bash
-cd /root/autodl-tmp/vision_finagent
-nohup python start.py > server.log 2>&1 &
+TRANSFORMERS_OFFLINE=1
+HF_DATASETS_OFFLINE=1
+
+VLM_API_BASE=https://your-openai-compatible-endpoint/v1
+VLM_MODEL=your-vlm-model
+VLM_API_KEY=your-key
+
+VLM_TIMEOUT=120
+VLM_QUERY_TIMEOUT=90
+INGEST_TIMEOUT=600
+QUERY_TIMEOUT=15
+REQUIRE_RETRIEVAL_GPU=true
 ```
 
-前台调试可直接运行：
+Milvus 默认使用本地 Lite 文件模式；如果需要切换到 Zilliz Cloud 或自建 Milvus，可配置：
+
+```env
+MILVUS_URI=https://your-zilliz-or-milvus-endpoint
+MILVUS_TOKEN=your-token
+MILVUS_DB_NAME=default
+```
+
+### 3. 启动服务
 
 ```bash
-cd /root/autodl-tmp/vision_finagent
 python start.py
 ```
 
-#### 不作为首选的启动方式
-
-以下命令不是当前文档推荐路径，因为它绕过了 [`start.py`](start.py) 这个统一入口，不利于复现实验结果与排查启动日志：
+后台运行：
 
 ```bash
-python -m uvicorn src.main:app --host 0.0.0.0 --port 8000
+nohup python start.py > server.log 2>&1 &
 ```
 
-### 3. 验证服务状态
+### 4. 检查服务状态
 
 ```bash
 curl http://localhost:8000/ready
 curl http://localhost:8000/schema-health
 nvidia-smi
 ```
-
-GPU 正常加载成功时返回：
-
-```json
-{"status":"ready"}
-```
-
-如启动失败，请第一时间看日志：
-
-```bash
-tail -f server.log
-```
-
-重点关注以下日志字段：
-
-- `cuda_available`
-- `first_param_device`
-- `hf_device_map`
-- `has_cuda_placement`
-- `cpu_fallback`
-- `model_ready`
-
-如果你在 GPU 服务器上看到模型没有任何层落在 CUDA，服务现在会直接启动失败，这是预期行为。
-
-### 4. 打开前端
 
 浏览器访问：
 
 ```text
-http://<服务器IP>:8000
-```
-
-### 5. 推荐启动后回归顺序
-
-```bash
-curl http://localhost:8000/ready
-curl http://localhost:8000/schema-health
-curl http://localhost:8000/reports/sessions
-```
-
-若要做完整回归，建议按以下顺序：
-
-1. 启动 Redis
-2. 使用 [`python start.py`](start.py) 启动服务
-3. 查看 [`server.log`](server.log)
-4. 查看 `nvidia-smi`
-5. 检查 [`/ready`](src/routers/health.py:17)
-6. 检查 [`/schema-health`](src/routers/health.py:58)
-7. 上传真实 PDF / 图片
-8. 轮询任务状态
-9. 执行一次真实 [`/reports/query`](src/routers/reports.py:341)
-
----
-
-## 停止与排查
-
-### 停止服务
-
-```bash
-pkill -f "python start.py"
-
-```
-
-### 查看日志
-
-```bash
-cd /root/autodl-tmp/vision_finagent
-tail -f server.log
-```
-
-### Redis 检查
-
-```bash
-redis-cli ping
-```
-
-返回 `PONG` 表示正常。
-
----
-
-## 常见问题
-
-### 1. `Open local milvus failed`
-
-原因：[`milvus_local.db`](milvus_local.db) 被旧进程占用。
-
-处理：
-
-```bash
-pkill -f "python start.py"
-
-```
-
-然后重新启动服务。
-
----
-
-### 2. 服务启动失败，日志里出现 GPU / device_map / CPU fallback
-
-如果日志中出现以下特征：
-
-- `CUDA is available but no model layer is on CUDA`
-- `hf_device_map={'': 'cpu'}`
-- `retrieval.model_device_mismatch`
-
-说明当前检索模型没有真正加载到 GPU。当前版本在 GPU 服务器上会把这视为启动失败，而不是静默降级。
-
-优先检查：
-
-1. [`.env`](.env) 中的 [`MODEL_PATH`](src/config.py) 是否指向 LoRA adapter 目录
-2. [`.env`](.env) 中的 [`BASE_MODEL_PATH`](src/config.py) 是否指向完整 base model 目录
-3. 是否使用了推荐启动命令 [`python start.py`](start.py)
-4. GPU 显存是否足够
-
-检查命令：
-
-```bash
-nvidia-smi
-tail -n 100 server.log
-```
-
-正常情况下，启动后 `nvidia-smi` 应看到明显显存占用，而不是只有几 MiB。
-
----
-
-### 3. 前端对话一直卡住
-
-已修复的根因：
-
-- 检索模型预热不再阻塞服务启动
-- 前端查询已加入超时控制
-- 后端查询已加入 `QUERY_TIMEOUT`
-
-如果仍然很慢，请先确认：
-
-```bash
-curl http://localhost:8000/ready
+http://<server-ip>:8000
 ```
 
 ---
 
-### 4. 上传失败，提示缺少 `company_ticker / fiscal_year / form_type`
+## API 示例
 
-这是旧接口形式导致的问题。当前上传接口已改成：
-
-- 必填：`file`
-- 可选：`report_id`
-
----
-
-## API 一览
-
-### 健康检查
-
-| Method | Path | 说明 |
-|--------|------|------|
-| GET | `/health` | 存活检查 |
-| GET | `/ready` | 就绪检查，探测 Redis + Milvus + 检索模型就绪状态 |
-| GET | `/schema-health` | schema 漂移检查 |
-
-### 报告接口
-
-| Method | Path | 说明 |
-|--------|------|------|
-| POST | `/reports/upload` | 上传 PDF 并异步向量化 |
-| GET | `/reports/tasks/{task_id}` | 轮询上传任务状态 |
-| POST | `/reports/query` | 页面检索查询 |
-| GET | `/reports/sessions` | 获取会话列表 |
-| GET | `/reports/sessions/{session_id}/history` | 获取对话历史 |
-| GET | `/reports/sessions/{session_id}/evidence-status` | 获取当前会话 evidence 可复用状态 |
-| GET | `/reports/admin/inventory` | 只读：枚举所有已入库报告及页数统计 |
-| GET | `/reports/admin/inventory/{report_id}` | 只读：检查指定 report_id 是否已入库 |
-| POST | `/reports/admin/clear-collections` | 清空并重建当前 Milvus 集合 |
-| GET | `/reports/{report_id}` | 报告状态占位接口 |
-
----
-
-## 上传示例
+### 上传财报
 
 ```bash
 curl -X POST http://localhost:8000/reports/upload \
-  -F "file=@/root/autodl-tmp/vidore_raw/pdfs/bank_of_america_2024.pdf" \
+  -F "file=@/path/to/bank_of_america_2024.pdf" \
   -F "report_id=bank_of_america_2024"
 ```
 
-返回示例：
+返回：
 
 ```json
 {
@@ -361,21 +227,19 @@ curl -X POST http://localhost:8000/reports/upload \
 }
 ```
 
-轮询任务状态：
+轮询任务：
 
 ```bash
 curl http://localhost:8000/reports/tasks/task_xxx
 ```
 
----
-
-## 查询示例
+### 查询财报
 
 ```bash
 curl -X POST http://localhost:8000/reports/query \
   -H "Content-Type: application/json" \
   -d '{
-    "question": "Bank of America 2024年净利润是多少？",
+    "question": "Bank of America 2024 年净利润是多少？",
     "target_companies": ["bank_of_america"],
     "top_k": 3,
     "use_retrieval": true,
@@ -383,7 +247,7 @@ curl -X POST http://localhost:8000/reports/query \
   }'
 ```
 
-返回示例：
+典型返回字段：
 
 ```json
 {
@@ -410,7 +274,7 @@ curl -X POST http://localhost:8000/reports/query \
 }
 ```
 
-复用上一轮 evidence 追问：
+复用上一轮 evidence：
 
 ```bash
 curl -X POST http://localhost:8000/reports/query \
@@ -424,123 +288,37 @@ curl -X POST http://localhost:8000/reports/query \
 
 ---
 
-## 报告清单示例
+## 健康检查与管理接口
 
-查看所有已入库报告：
-
-```bash
-curl http://localhost:8000/reports/admin/inventory
-```
-
-返回示例：
-
-```json
-{
-  "collection": "fin_vision_reports_v2_pages",
-  "total_reports": 2,
-  "total_rows_fetched": 310,
-  "truncated": false,
-  "max_rows": 16000,
-  "reports": [
-    {"report_id": "bank_of_america_2024", "page_count": 305, "page_nums": [1, 2, "..."]},
-    {"report_id": "gupiao", "page_count": 5, "page_nums": [1, 2, 3, 4, 5]}
-  ]
-}
-```
-
-确认某个报告是否已入库：
-
-```bash
-curl http://localhost:8000/reports/admin/inventory/bank_of_america_2024
-```
-
-返回示例（已入库）：
-
-```json
-{
-  "report_id": "bank_of_america_2024",
-  "found": true,
-  "page_count": 305,
-  "page_nums": [1, 2, 3, "..."],
-  "collection": "fin_vision_reports_v2_pages",
-  "truncated": false
-}
-```
-
-返回示例（未入库）：
-
-```json
-{
-  "report_id": "bank_of_america_2024",
-  "found": false,
-  "page_count": 0,
-  "page_nums": [],
-  "collection": "fin_vision_reports_v2_pages",
-  "truncated": false
-}
-```
-
-> `truncated: true` 表示库中行数超过 `max_rows`（默认 16000），结果可能不完整。
+| Method | Path | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 存活检查 |
+| GET | `/ready` | Redis + Milvus + 检索模型就绪检查 |
+| GET | `/schema-health` | Milvus schema 漂移检查 |
+| POST | `/reports/upload` | 上传 PDF / 图片并异步向量化 |
+| GET | `/reports/tasks/{task_id}` | 查询入库任务状态 |
+| POST | `/reports/query` | 财报检索问答 |
+| GET | `/reports/sessions` | 获取会话列表 |
+| GET | `/reports/sessions/{session_id}/history` | 获取历史对话 |
+| GET | `/reports/sessions/{session_id}/evidence-status` | 获取 evidence 可复用状态 |
+| GET | `/reports/admin/inventory` | 枚举已入库报告 |
+| POST | `/reports/admin/clear-collections` | 清空并重建 Milvus 集合 |
 
 ---
 
-## 会话历史示例
+## 工程化设计要点
 
-```bash
-curl http://localhost:8000/reports/sessions/demo-session-001/history
-```
-
----
-
-## 当前查询链路说明
-
-当前 [`/reports/query`](src/routers/reports.py:341) 的主链路为：
-
-1. [`retrieve()`](src/services/retrieval_service.py:227) 做 ColPali 页面级检索
-2. 将轻量 evidence 缓存到 Redis
-3. 调用 [`generate_answer()`](src/services/vlm_service.py:64) 生成回答
-4. 若 VLM 超时或失败，则降级为 evidence 摘要，但仍返回检索结果
-5. 将历史、多轮状态、evidence 可复用状态持久化到 Redis
-
-也就是说：
-
-- 当前主路径是 **检索 + VLM + evidence 返回**
-- VLM 不是硬依赖；超时会返回 `degraded=true` 与 `degrade_reason`
-- 当前会话状态不再保存在内存，而是保存在 Redis 中，支持刷新恢复与 evidence 复用
+- **GPU fail-fast**：在 GPU 服务器上若检索模型未真正加载到 CUDA，服务直接启动失败，避免静默 CPU fallback。
+- **超时分层**：区分 VLM HTTP 超时、查询 pipeline 超时和入库超时，避免前端长时间挂起。
+- **降级返回**：当 VLM 超时或失败时仍返回 evidence 摘要，保证用户能看到检索证据。
+- **Redis 状态持久化**：会话历史与 evidence cache 不保存在内存，支持刷新恢复与多轮追问。
+- **schema-health**：提供向量库 schema 漂移检查，便于定位 collection 字段不一致问题。
 
 ---
 
-## 架构概览
+## 可向面试官说明的项目亮点
 
-```text
-FastAPI
-├── /health, /ready
-├── /schema-health
-├── /reports/upload
-├── /reports/tasks/{task_id}
-├── /reports/query
-├── /reports/admin/inventory
-├── /reports/admin/inventory/{report_id}
-├── /reports/admin/clear-collections
-├── /reports/sessions
-├── /reports/sessions/{session_id}/history
-├── /reports/sessions/{session_id}/evidence-status
-└── Static Frontend (/)
-
-Retrieval Flow
-├── PDF upload
-├── ingestion_service
-├── Milvus Lite patch/page collections
-├── retrieval_service
-├── vlm_service
-├── Redis session/evidence cache
-└── Frontend chat results
-```
-
----
-
-## 备注
-
-- [`src/graph/`](src/graph/) 中保留了 LangGraph 编排代码
-- 当前线上主路径已经是稳定的 [`/reports/query`](src/routers/reports.py:341) 直连链路
-- [`probe_triton_spec.py`](probe_triton_spec.py) 用于验证 [`triton.__spec__`](start.py:7) 问题是否真实存在；当前环境结论是“无法证实”，但兼容补丁仍可保留为防御性代码
+- 针对财报表格和复杂版式场景，引入 ColPali 页面级视觉检索，避免纯文本切分丢失关键信息。
+- 使用 MaxSim late-interaction 计算 query 与页面多向量相关性，提升页面级 evidence 定位能力。
+- 通过 evidence cache、多轮 session 和 degraded fallback 提升系统可用性。
+- 通过 Recall@K、Answer Accuracy、Citation Accuracy 等指标评估检索和回答链路，而不是只看模型生成效果。
