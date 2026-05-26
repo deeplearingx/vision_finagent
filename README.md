@@ -313,7 +313,7 @@ curl -X POST http://localhost:8000/reports/query \
 
 ---
 
-## 可向面试官说明的项目亮点
+## 项目亮点
 
 - 针对财报表格和复杂版式场景，引入 ColPali 页面级视觉检索，避免纯文本切分丢失关键信息。
 - 使用 MaxSim late-interaction 计算 query 与页面多向量相关性，提升页面级 evidence 定位能力。
