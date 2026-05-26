@@ -358,8 +358,24 @@ async def _build_pages_from_cache(
 
 _NUMERIC_Q = re.compile(
     r"20\d{2}|amount|revenue|income|asset|liabilit|equity|expense|"
-    r"profit|loss|repurchase|stock|share|dividend|fair value|"
+    r"profit|loss|repurchase|stock|share|dividend|fair value|rate|"
     r"what was|how much|多少|金额|收入|利润|资产|负债|权益|回购|股息",
+    re.IGNORECASE,
+)
+
+_COMPARISON_Q = re.compile(
+    r"compare|comparison|versus|vs\.?|difference|between|higher|lower|"
+    r"better|worse|more than|less than|exceed|underperform|outperform|"
+    r"比较|对比|差异|高于|低于|超过",
+    re.IGNORECASE,
+)
+
+# Core financial entities that should appear in a good answer
+_CORE_ENTITIES = re.compile(
+    r"revenue|income|profit|loss|asset|liabilit|equity|expense|dividend|"
+    r"repurchase|interest|rate|risk|capital|cet1|tier|leverage|"
+    r"preferred|common|share|stock|derivative|fair value|"
+    r"commercial real estate|cre|deposit|loan|credit|provision",
     re.IGNORECASE,
 )
 
@@ -375,6 +391,19 @@ def _answer_has_citation(answer: str | None) -> bool:
     return "page" in a or "page_num" in a or "页" in answer
 
 
+def _answer_misses_core_entity(question: str, answer: str | None) -> bool:
+    """Check if the answer is missing a core financial entity mentioned in the question."""
+    if not answer or len(answer) < 20:
+        return True
+    q_entities = set(m.group().lower() for m in _CORE_ENTITIES.finditer(question))
+    if not q_entities:
+        return False
+    a_lower = answer.lower()
+    # If more than half the question's core entities are missing from the answer, trigger
+    missing = sum(1 for e in q_entities if e not in a_lower)
+    return missing > len(q_entities) / 2
+
+
 def _low_score_margin(pages: list) -> bool:
     if len(pages) < 5:
         return False
@@ -382,14 +411,26 @@ def _low_score_margin(pages: list) -> bool:
 
 
 def should_trigger_second_pass(question: str, answer: str | None, pages: list) -> bool:
+    """Determine if a second VLM pass is needed. Logs the specific trigger reason for observability."""
     if is_insufficient_evidence(answer):
+        log.info("second_pass.trigger", reason="insufficient_evidence", question=question[:80])
         return True
     if _NUMERIC_Q.search(question) and not _answer_has_number(answer):
+        log.info("second_pass.trigger", reason="numeric_q_no_number", question=question[:80])
+        return True
+    if _COMPARISON_Q.search(question) and not _answer_has_number(answer):
+        log.info("second_pass.trigger", reason="comparison_q_no_number", question=question[:80])
         return True
     if pages and not _answer_has_citation(answer):
+        log.info("second_pass.trigger", reason="no_citation", question=question[:80])
         return True
     if _low_score_margin(pages):
+        log.info("second_pass.trigger", reason="low_score_margin", question=question[:80])
         return True
+    if _answer_misses_core_entity(question, answer):
+        log.info("second_pass.trigger", reason="misses_core_entity", question=question[:80])
+        return True
+    log.info("second_pass.no_trigger", question=question[:80])
     return False
 
 

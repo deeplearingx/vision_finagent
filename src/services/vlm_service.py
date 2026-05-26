@@ -64,13 +64,19 @@ def _get_async_client() -> AsyncOpenAI:
 INSUFFICIENT_EVIDENCE_PHRASE = "Insufficient evidence in provided pages"
 
 _FIN_DOC_SYSTEM = (
-    "You are a financial document analyst. "
-    "Answer strictly from the provided evidence pages. "
-    "Ignore cover pages, table-of-contents pages, and disclaimer pages. "
-    "Prioritize financial statements, notes, tables, and MD&A sections. "
-    "For numerical answers, preserve exact value, unit, sign, year, and company. "
-    "Every factual answer must cite report_id and page_num. "
-    f"If evidence is insufficient, explicitly state '{INSUFFICIENT_EVIDENCE_PHRASE}'."
+    "You are a financial document analyst. Your task is to extract factual information from provided evidence pages.\n\n"
+    "Extraction-first workflow:\n"
+    "1. For EACH evidence page, scan for facts relevant to the question (numbers, names, dates, ratios, descriptions).\n"
+    "2. If a page contains a relevant number, table row, or descriptive passage, you MUST use it — do not skip it.\n"
+    "3. Only after scanning all pages, compose your answer by combining the extracted facts.\n"
+    "4. For numerical answers, preserve exact value, unit, sign, year, and company.\n"
+    "5. Every factual answer must cite report_id and page_num.\n\n"
+    "Strict rules:\n"
+    "- Ignore cover pages, table-of-contents pages, and disclaimer pages.\n"
+    "- Prioritize financial statements, notes, tables, and MD&A sections.\n"
+    "- If ANY evidence page contains a number or description directly relevant to the question, you MUST answer — "
+    "do NOT say evidence is insufficient.\n"
+    f"- Only state '{INSUFFICIENT_EVIDENCE_PHRASE}' if NONE of the provided pages contain any relevant factual information."
 )
 
 
@@ -143,6 +149,100 @@ _NO_EVIDENCE_NOTE = (
 )
 
 
+def _extract_relevant_text_snippet(query: str, page_text: str, max_chars: int = 2000) -> str:
+    """Extract a question-aware text snippet from page_text.
+
+    Strategy:
+    1. Tokenize query into keywords (>= 3 chars, not stop words).
+    2. Find all occurrences of keywords in page_text.
+    3. If hits found: extract a window centered around the best cluster of hits.
+    4. If no hits: fall back to the first max_chars characters.
+    """
+    if not page_text:
+        return ""
+    if len(page_text) <= max_chars:
+        return page_text
+
+    # Extract query keywords
+    _STOP = {"the", "a", "an", "is", "are", "was", "were", "how", "what", "which",
+             "and", "or", "not", "for", "its", "does", "did", "has", "had", "have",
+             "this", "that", "with", "from", "into", "are", "was", "can", "may"}
+    tokens = set(re.findall(r'[a-zA-Z0-9]{3,}', query.lower()))
+    keywords = {t for t in tokens if t not in _STOP}
+
+    # Diagnostic: also show what short tokens were dropped (< 3 chars)
+    all_raw_tokens = set(re.findall(r'[a-zA-Z0-9]+', query.lower()))
+    dropped_short = {t for t in all_raw_tokens if len(t) < 3}
+
+    if not keywords:
+        log.warning(
+            "snippet.no_keywords_after_filter",
+            query=query[:80],
+            raw_tokens=all_raw_tokens,
+            dropped_short=dropped_short,
+            fallback="first_max_chars",
+        )
+        return page_text[:max_chars]
+
+    # Find all keyword hit positions
+    text_lower = page_text.lower()
+    hit_positions: list[int] = []
+    for kw in keywords:
+        start = 0
+        while True:
+            pos = text_lower.find(kw, start)
+            if pos == -1:
+                break
+            hit_positions.append(pos)
+            start = pos + len(kw)
+
+    if not hit_positions:
+        log.info(
+            "snippet.no_hits_fallback",
+            query=query[:80],
+            keywords=keywords,
+            dropped_short=dropped_short,
+            page_text_len=len(page_text),
+            fallback="first_max_chars",
+        )
+        return page_text[:max_chars]
+
+    # Find the best window of max_chars that contains the most hits
+    hit_positions.sort()
+    best_start = 0
+    best_count = 0
+
+    # Sliding window: try starting at each hit position
+    for i, pos in enumerate(hit_positions):
+        window_end = pos + max_chars
+        # Count hits within this window
+        count = sum(1 for p in hit_positions if pos <= p < window_end)
+        if count > best_count:
+            best_count = count
+            best_start = pos
+
+    # Expand to include some context before the first hit
+    context_start = max(0, best_start - 200)
+    snippet = page_text[context_start:context_start + max_chars]
+
+    # Try to start at a paragraph/sentence boundary
+    newline_pos = snippet.find("\n")
+    if 0 < newline_pos < 200:
+        snippet = snippet[newline_pos + 1:]
+
+    log.info(
+        "snippet.extracted",
+        query=query[:80],
+        keywords=keywords,
+        dropped_short=dropped_short,
+        total_hits=len(hit_positions),
+        best_window_hits=best_count,
+        snippet_preview=snippet[:120],
+    )
+
+    return snippet
+
+
 def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
     """Build VLM message list with financial-document analysis instructions.
 
@@ -158,11 +258,13 @@ def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
             "type": "text",
             "text": (
                 f"Question:\n{prefix + query}\n\n"
-                "Requirements:\n"
-                "1. Use only the provided evidence pages.\n"
-                "2. For numerical answers, preserve exact value, unit, year, and company.\n"
-                "3. Cite evidence using report_id and page_num.\n"
-                f"4. If evidence is insufficient, say exactly: {INSUFFICIENT_EVIDENCE_PHRASE}."
+                "Extraction-first instructions:\n"
+                "1. For EACH evidence page below, scan for facts relevant to the question.\n"
+                "2. If a page contains a relevant number, table row, or description, extract it.\n"
+                "3. Combine extracted facts into your final answer.\n"
+                "4. For numerical answers, preserve exact value, unit, year, and company.\n"
+                "5. Cite evidence using report_id and page_num.\n"
+                f"6. Only say '{INSUFFICIENT_EVIDENCE_PHRASE}' if NONE of the pages contain relevant facts."
             ),
         }
     ]
@@ -170,7 +272,7 @@ def _build_messages(query: str, pages: List[PageResult]) -> list[dict]:
     total_orig, total_comp, img_count = 0, 0, 0
 
     for p in pages[: settings.MAX_VLM_IMAGES]:
-        _page_text_snippet = p.page_text[:2000] if p.page_text else ""
+        _page_text_snippet = _extract_relevant_text_snippet(query, p.page_text, max_chars=2000) if p.page_text else ""
         _text_section = f"\npage_text:\n{_page_text_snippet}\n" if _page_text_snippet else ""
         user_content.append({
             "type": "text",

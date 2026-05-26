@@ -56,9 +56,9 @@ class Settings(BaseSettings):
 
     # Second-pass VLM evidence expansion (conservative two-round mode)
     VLM_SECOND_PASS_ENABLED: bool = True
-    VLM_SECOND_PASS_TOP_K: int = 10       # expanded top_k for second retrieval
-    VLM_SECOND_PASS_CANDIDATE_K: int = 100  # expanded candidate_k for second retrieval
-    VLM_SECOND_PASS_MAX_IMAGES: int = 10  # max images sent to VLM in second pass
+    VLM_SECOND_PASS_TOP_K: int = 15       # expanded top_k for second retrieval
+    VLM_SECOND_PASS_CANDIDATE_K: int = 240  # expanded candidate_k for second retrieval
+    VLM_SECOND_PASS_MAX_IMAGES: int = 12  # max images sent to VLM in second pass
 
     # VLM outbound image compression (applied only before sending to VLM, not stored)
     VLM_IMG_MAX_SIDE: int = 1536   # resize longest side to this (pixels); 0 = no resize
